@@ -49,6 +49,9 @@ out/
 # Data caches (regenerated from Excel)
 data_cache/
 
+# SQLite
+*.db
+
 # IDE
 .idea/
 .vscode/

@@ -35,6 +35,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ algos, max_cases: maxCases, seed, min_clients: minClients }),
     }),
+  routes: () => jsonRequest('/routes'),
+  routeDetail: (date, ruta) => jsonRequest(`/routes/${date}/${ruta}`),
 };
 
 export const SIM_API_BASE = BASE;

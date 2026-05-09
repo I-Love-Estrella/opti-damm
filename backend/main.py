@@ -1,6 +1,10 @@
 from contextlib import asynccontextmanager
 import os
 
+from backend.env import load_local_env
+
+load_local_env()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,6 +13,7 @@ from backend.database import Base, engine
 from backend.factory import seed
 from backend.routers.routes import router as routes_router
 from backend.routers.clients import router as clients_router
+from backend.routers.copilot import router as copilot_router
 from backend.routers.pdfs import router as pdfs_router
 from backend.routers.simulator import router as simulator_router
 
@@ -48,6 +53,7 @@ app.add_middleware(
 
 app.include_router(routes_router)
 app.include_router(clients_router)
+app.include_router(copilot_router)
 app.include_router(pdfs_router)
 app.include_router(simulator_router)
 

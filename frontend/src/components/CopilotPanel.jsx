@@ -1,15 +1,25 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import MarkdownMessage from './MarkdownMessage';
 
-export default function CopilotPanel({ messages, prompts, onPrompt, isTyping, sysLog }) {
+export default function CopilotPanel({ messages, onAsk, isTyping, sysLog }) {
   const streamRef = useRef(null);
+  const [draft, setDraft] = useState('');
 
   useEffect(() => {
     if (streamRef.current) {
       streamRef.current.scrollTop = streamRef.current.scrollHeight;
     }
   }, [messages, isTyping]);
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    const text = draft.trim();
+    if (!text || isTyping) return;
+    setDraft('');
+    onAsk(text);
+  }
 
   return (
     <div className="panel copilot-panel">
@@ -44,11 +54,20 @@ export default function CopilotPanel({ messages, prompts, onPrompt, isTyping, sy
       <div className="stream" ref={streamRef}>
         {messages.map((m, i) => {
           if (m.kind === "alert") {
-            return <div key={i} className="msg alert">⚠ {m.text}</div>;
+            return (
+              <div key={i} className="msg alert">
+                <span aria-hidden="true">⚠ </span>
+                <MarkdownMessage text={m.text} />
+              </div>
+            );
           }
           return (
             <div key={i} className={`msg ${m.kind}`}>
-              <div dangerouslySetInnerHTML={{ __html: m.text }} />
+              {m.kind === 'claude' ? (
+                <MarkdownMessage text={m.text} />
+              ) : (
+                <div className="plain-message">{m.text}</div>
+              )}
             </div>
           );
         })}
@@ -59,18 +78,16 @@ export default function CopilotPanel({ messages, prompts, onPrompt, isTyping, sy
         )}
       </div>
 
-      <div className="prompts">
-        {prompts.map(p => (
-          <button
-            key={p.id}
-            className={`prompt-btn ${p.alert ? 'alert-prompt' : ''}`}
-            disabled={p.disabled}
-            onClick={() => onPrompt(p)}
-          >
-            {p.alert ? '⚠ ' : ''}{p.label}
-          </button>
-        ))}
-      </div>
+      <form className="copilot-input" onSubmit={handleSubmit}>
+        <input
+          value={draft}
+          disabled={isTyping}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Ask about this route, client, load, or simulation..."
+          aria-label="Ask copilot"
+        />
+        <button type="submit" disabled={isTyping || !draft.trim()} title="Send">↵</button>
+      </form>
     </div>
   );
 }

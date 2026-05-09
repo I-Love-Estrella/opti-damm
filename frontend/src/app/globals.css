@@ -1861,6 +1861,58 @@ button {
 .section-fullscreen .stat-value {
   font-size: 54px;
 }
+
+/* All-KPIs fullscreen: dense grid, restrained type so 27 stats fit. */
+.metrics-full {
+  padding: 32px 48px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  align-content: stretch;
+}
+.metrics-full-head {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+.metrics-full-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 28px 36px;
+  align-items: start;
+}
+.metrics-full-group-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.5;
+  margin-bottom: 10px;
+  border-bottom: 1px solid rgba(244, 239, 227, 0.12);
+  padding-bottom: 6px;
+}
+.metrics-full-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 16px;
+}
+.section-fullscreen .metrics-full .stat-value {
+  font-size: 22px;
+  line-height: 1.1;
+}
+.section-fullscreen .metrics-full .stat-label {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  margin-bottom: 2px;
+}
+.section-fullscreen .metrics-full .stat-value .unit {
+  font-size: 11px;
+  margin-left: 3px;
+  opacity: 0.6;
+}
 .section-fullscreen .slider-label {
   font-size: 22px;
 }

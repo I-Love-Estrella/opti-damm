@@ -109,17 +109,15 @@ export default function MetricsBar({ kpis, fullscreen }) {
 
   if (fullscreen) {
     return (
-      <div className="metrics metrics-full" style={{ padding: 16, overflow: 'auto' }}>
-        <div className="stats-head" style={{ marginBottom: 12 }}>
+      <div className="metrics metrics-full">
+        <div className="metrics-full-head">
           {empty ? 'Awaiting simulation…' : 'All KPIs'}
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
+        <div className="metrics-full-grid">
           {GROUPS.map((g) => (
-            <div key={g.title}>
-              <div style={{ fontSize: 11, opacity: 0.6, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-                {g.title}
-              </div>
-              <div className="stats-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <div key={g.title} className="metrics-full-group">
+              <div className="metrics-full-group-title">{g.title}</div>
+              <div className="metrics-full-stats">
                 {g.items.map((it) => (
                   <Stat
                     key={it.key}

@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +15,8 @@ from backend.routers.pdfs import router as pdfs_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
-    seed()
+    if os.getenv("SEED_DATABASE_ON_STARTUP", "").lower() in {"1", "true", "yes"}:
+        seed()
     app.state.dl = DataLayer()
     yield
 

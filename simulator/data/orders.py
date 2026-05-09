@@ -114,7 +114,9 @@ class DayCaseBuilder:
         groups = groups[groups["clients"] >= min_clients].sort_values(["fecha", "Ruta"])
         return groups.reset_index(drop=True)
 
-    def build(self, fecha: dt.date, ruta: str) -> DayCase:
+    def build(
+        self, fecha: dt.date, ruta: str, truck_code: str | None = None
+    ) -> DayCase:
         d = self._detalle
         mask = (d["FECHA"].dt.date == fecha) & (d["Ruta"] == ruta)
         rows = d.loc[mask].copy()
@@ -125,7 +127,16 @@ class DayCaseBuilder:
         transports = tuple(sorted(rows["Transporte"].dropna().astype(str).unique().tolist()))
 
         orders = self._build_orders(rows)
-        truck = self._pick_truck(orders)
+        if truck_code is None:
+            truck = self._pick_truck(orders)
+        else:
+            code = str(truck_code).upper()
+            if code not in TRUCK_SPECS:
+                raise KeyError(
+                    f"Unknown truck code: {truck_code!r}. "
+                    f"Known: {sorted(TRUCK_SPECS)}"
+                )
+            truck = TRUCK_SPECS[code]
 
         depot = DepotInfo(name=DEPOT_NAME, lat=DEPOT_LAT, lon=DEPOT_LON)
 
@@ -138,6 +149,37 @@ class DayCaseBuilder:
             orders=tuple(orders),
             raw_transports=transports,
         )
+
+    def fit_check(
+        self, orders: list[ClientOrder] | tuple[ClientOrder, ...], truck: TruckSpec
+    ) -> dict:
+        """Pure capacity precheck — does the order fit on this truck without
+        even running the algorithm? Returns volume/weight stats and a
+        list of human-readable reasons when it doesn't."""
+
+        total_vol = sum(o.total_volume_m3 for o in orders)
+        total_wt = sum(o.total_weight_kg for o in orders)
+        cap_vol = truck.pallet_capacity * PALLET_VOLUME_M3
+        cap_wt = truck.max_weight_kg
+        reasons: list[str] = []
+        if total_vol > cap_vol:
+            reasons.append(
+                f"Order volume {total_vol:.2f} m³ exceeds truck "
+                f"capacity {cap_vol:.2f} m³ ({truck.code})"
+            )
+        if total_wt > cap_wt:
+            reasons.append(
+                f"Order weight {total_wt:.0f} kg exceeds truck "
+                f"max {cap_wt:.0f} kg ({truck.code})"
+            )
+        return {
+            "fits": not reasons,
+            "total_volume_m3": float(total_vol),
+            "capacity_volume_m3": float(cap_vol),
+            "total_weight_kg": float(total_wt),
+            "capacity_weight_kg": float(cap_wt),
+            "reasons": reasons,
+        }
 
     def _build_orders(self, rows: pd.DataFrame) -> list[ClientOrder]:
         rows = rows.copy()

@@ -408,6 +408,49 @@
   font-weight: 600;
 }
 
+.viz-collapsible > .viz-summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 0;
+  user-select: none;
+}
+
+.viz-collapsible > .viz-summary::-webkit-details-marker {
+  display: none;
+}
+
+.viz-collapsible > .viz-summary h4 {
+  margin: 0;
+}
+
+.viz-collapsible[open] > .viz-summary h4 {
+  margin-bottom: 12px;
+}
+
+.viz-collapsible .viz-toggle {
+  font-family: var(--mono);
+  letter-spacing: 0.1em;
+  color: #fc0;
+  background: #131313;
+  padding: 4px 10px;
+  border: 1px solid #fc0;
+  border-radius: 2px;
+  white-space: nowrap;
+  font-size: 10px;
+}
+
+.viz-collapsible[open] .viz-toggle::before {
+  content: 'Hide ▴';
+}
+
+.viz-collapsible:not([open]) .viz-toggle::before {
+  content: 'Show ▾';
+}
+
 .route-map-wrap {
   width: 100%;
   border: 1px solid var(--algo-border);
@@ -1105,6 +1148,21 @@
   border-radius: 2px;
   white-space: nowrap;
   user-select: none;
+}
+
+.r3d-count-badge {
+  background: #0a0a0a;
+  color: #fc0;
+  padding: 2px 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 800;
+  border: 1.5px solid #fc0;
+  border-radius: 10px;
+  white-space: nowrap;
+  user-select: none;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.6);
+  letter-spacing: 0.04em;
 }
 
 .truck3d-error {

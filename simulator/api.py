@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 
 from simulator.algorithms import REGISTRY, get
 from simulator.bench.runner import BenchConfig, run as bench_run
+from simulator.config import TRUCK_SPECS
 from simulator.core.simulator import Simulator
 from simulator.data.catalog import (
     Catalog,
@@ -87,6 +88,20 @@ def _list_algorithms() -> list[dict]:
     return out
 
 
+def _list_trucks() -> list[dict]:
+    return [
+        {
+            "code": spec.code,
+            "name": spec.name,
+            "pallet_capacity": spec.pallet_capacity,
+            "max_weight_kg": spec.max_weight_kg,
+            "sides": list(spec.sides),
+            "fleet_count": spec.fleet_count,
+        }
+        for spec in TRUCK_SPECS.values()
+    ]
+
+
 def _list_days(min_clients: int, head: int) -> dict:
     ctx = _ctx()
     builder: DayCaseBuilder = ctx["builder"]  # type: ignore
@@ -111,7 +126,13 @@ def _list_days(min_clients: int, head: int) -> dict:
     return {"total": int(len(df)), "items": items}
 
 
-def _run_one(date: str, ruta: str, algo: str, strict_physics: bool = False) -> dict:
+def _run_one(
+    date: str,
+    ruta: str,
+    algo: str,
+    strict_physics: bool = False,
+    truck_code: str | None = None,
+) -> dict:
     ctx = _ctx()
     builder: DayCaseBuilder = ctx["builder"]  # type: ignore
     clients: Clients = ctx["clients"]  # type: ignore
@@ -119,7 +140,8 @@ def _run_one(date: str, ruta: str, algo: str, strict_physics: bool = False) -> d
     sim_default: Simulator = ctx["sim"]  # type: ignore
 
     fecha = dt.date.fromisoformat(date)
-    case = builder.build(fecha, ruta)
+    case = builder.build(fecha, ruta, truck_code=truck_code)
+    fit = builder.fit_check(case.orders, case.truck)
     if algo not in REGISTRY:
         raise ValueError(f"Unknown algorithm: {algo}")
     plan = get(algo).plan(case, clients, network)
@@ -268,10 +290,13 @@ def _run_one(date: str, ruta: str, algo: str, strict_physics: bool = False) -> d
         "ruta": case.ruta,
         "truck": {
             "code": case.truck.code,
+            "name": case.truck.name,
             "pallet_capacity": case.truck.pallet_capacity,
             "max_weight_kg": case.truck.max_weight_kg,
             "sides": list(case.truck.sides),
+            "manual_override": truck_code is not None,
         },
+        "fit": fit,
         "depot": depot,
         "stops": stops,
         "legs": legs,
@@ -552,6 +577,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/algorithms":
                 self._json(200, {"algorithms": _list_algorithms()})
                 return
+            if url.path == "/api/trucks":
+                self._json(200, {"trucks": _list_trucks()})
+                return
             if url.path == "/api/types":
                 self._json(200, {"types": _list_physical_types()})
                 return
@@ -584,10 +612,22 @@ class Handler(BaseHTTPRequestHandler):
                 ruta = str(body.get("ruta") or "")
                 algo = str(body.get("algo") or "")
                 strict = bool(body.get("strict_physics") or False)
+                truck_code_raw = body.get("truck_code")
+                truck_code = (
+                    str(truck_code_raw).strip().upper() or None
+                    if truck_code_raw is not None
+                    else None
+                )
                 if not (date and ruta and algo):
                     self._json(400, {"error": "missing date/ruta/algo"})
                     return
-                self._json(200, _run_one(date, ruta, algo, strict_physics=strict))
+                self._json(
+                    200,
+                    _run_one(
+                        date, ruta, algo,
+                        strict_physics=strict, truck_code=truck_code,
+                    ),
+                )
                 return
             if url.path == "/api/bench":
                 algos = body.get("algos") or list(REGISTRY.keys())

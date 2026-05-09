@@ -551,11 +551,11 @@ class Simulator:
         item = PalletItem(
             sku=cmd.sku,
             qty=cmd.qty,
-            unit_volume_m3=0.04,
-            unit_weight_kg=2.0,
+            unit_volume_m3=cmd.unit_volume_m3,
+            unit_weight_kg=cmd.unit_weight_kg,
             intended_client=None,
             is_returnable_empty=True,
-            physical_type="keg",
+            physical_type=cmd.physical_type,
             pos_x=pos_x,
             pos_y=pos_y,
             pos_z=pos_z,
@@ -866,11 +866,55 @@ class Simulator:
             target_pos_y = new_pos.pos_y if new_pos is not None else b.pos_y
             target_pos_z = new_pos.pos_z if new_pos is not None else b.pos_z
 
-            if new_pos is not None and (
+            # Check whether the blocker's intended landing spot is
+            # still physically valid. After Phase 2 / Phase 3 the
+            # original supporter may have been delivered, so the
+            # "no-op" restock (target_pos == b.pos) would leave the
+            # blocker floating in mid-air until the post-batch settle
+            # pass moves it. The visualizer renders that floating
+            # interval, which the user sees as a hovering box.
+            cur_pallet_check = st.cargo.pallet_at(slot_id)
+            needs_relocation = False
+            if cur_pallet_check is not None:
+                # Build a "what the pallet looks like without b" view
+                # so the collision check doesn't trip on the blocker
+                # itself.
+                others_for_check = type(cur_pallet_check)(
+                    pallet_id=cur_pallet_check.pallet_id,
+                    kind=cur_pallet_check.kind,
+                    items=tuple(it for it in cur_pallet_check.items if it is not b),
+                    primary_client=cur_pallet_check.primary_client,
+                    notes=cur_pallet_check.notes,
+                    pallet_class=cur_pallet_check.pallet_class,
+                )
+                if _aabb_collides_with_pallet(
+                    target_pos_x, target_pos_y, target_pos_z,
+                    b.dim_x, b.dim_y, b.dim_h, others_for_check,
+                ) or not _has_support(
+                    target_pos_x, target_pos_y, target_pos_z,
+                    b.dim_x, b.dim_y, others_for_check,
+                ):
+                    snapped_now = _find_clean_position(
+                        others_for_check, b.dim_x, b.dim_y, b.dim_h
+                    )
+                    if snapped_now is None:
+                        snapped_now = _find_clean_position(
+                            others_for_check, b.dim_x, b.dim_y, b.dim_h,
+                            enforce_pallet_height=False,
+                        )
+                    if snapped_now is not None and (
+                        abs(snapped_now[0] - target_pos_x) > 1e-6
+                        or abs(snapped_now[1] - target_pos_y) > 1e-6
+                        or abs(snapped_now[2] - target_pos_z) > 1e-6
+                    ):
+                        target_pos_x, target_pos_y, target_pos_z = snapped_now
+                        needs_relocation = True
+
+            if needs_relocation or (new_pos is not None and (
                 abs(target_pos_x - b.pos_x) > 1e-6
                 or abs(target_pos_y - b.pos_y) > 1e-6
                 or abs(target_pos_z - b.pos_z) > 1e-6
-            ):
+            )):
                 # Physically move the blocker on the pallet — but only
                 # if its target spot actually differs from where it is.
                 # Identity removal (`remove_specific`) avoids the bug

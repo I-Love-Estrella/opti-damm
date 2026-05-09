@@ -39,6 +39,86 @@ from simulator.domain.packing import find_position
 from simulator.domain.pallet import PalletItem
 
 
+def _find_position_on_empties(
+    items: list[PalletItem],
+    dim_x: float,
+    dim_y: float,
+    stack_h: float,
+) -> tuple[float, float, float] | None:
+    """Find a position for a new empty keg that stacks ONLY on top of
+    other empties (or on the floor at a corner of an empty). Returning
+    None forces the caller to try a different slot or fall back."""
+    from simulator.config import PALLET_HEIGHT_M, PALLET_LENGTH_M, PALLET_WIDTH_M
+
+    eps = 1e-6
+    live = [it for it in items if it.qty > 0]
+    empties = [it for it in live if it.is_returnable_empty]
+    # Anchors: top-of-empty (perched) + corners-beside-empty (floor).
+    anchors: list[tuple[float, float, float]] = []
+    for it in empties:
+        anchors.append((it.pos_x, it.pos_y, it.top_z))
+        anchors.append((it.end_x, it.pos_y, it.pos_z))
+        anchors.append((it.pos_x, it.end_y, it.pos_z))
+
+    seen: set[tuple[float, float, float]] = set()
+    best: tuple[float, float, float] | None = None
+    for (x, y, z) in anchors:
+        key = (round(x, 4), round(y, 4), round(z, 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        if x < -eps or y < -eps or z < -eps:
+            continue
+        if x + dim_x > PALLET_LENGTH_M + eps:
+            continue
+        if y + dim_y > PALLET_WIDTH_M + eps:
+            continue
+        if z + stack_h > PALLET_HEIGHT_M + eps:
+            continue
+        # 3D collision against all live items (incl. non-empty).
+        new_box = (x, y, z, x + dim_x, y + dim_y, z + stack_h)
+        collides = False
+        for it in live:
+            if (
+                new_box[0] < it.end_x - eps
+                and it.pos_x < new_box[3] - eps
+                and new_box[1] < it.end_y - eps
+                and it.pos_y < new_box[4] - eps
+                and new_box[2] < it.top_z - eps
+                and it.pos_z < new_box[5] - eps
+            ):
+                collides = True
+                break
+        if collides:
+            continue
+        # If perched (z > 0), require ≥50% support coverage AND require
+        # the supporter(s) to be empties.
+        if z > eps:
+            base = dim_x * dim_y
+            covered = 0.0
+            covered_by_empty = 0.0
+            for it in live:
+                if abs(it.top_z - z) > eps:
+                    continue
+                ox = max(0.0, min(x + dim_x, it.end_x) - max(x, it.pos_x))
+                oy = max(0.0, min(y + dim_y, it.end_y) - max(y, it.pos_y))
+                area = ox * oy
+                if area <= 0:
+                    continue
+                covered += area
+                if it.is_returnable_empty:
+                    covered_by_empty += area
+            if covered < 0.5 * base:
+                continue
+            if covered_by_empty < covered - eps:
+                # Some supporter is not an empty → reject (would float
+                # later when the cargo item gets delivered).
+                continue
+        if best is None or (z, y, x) < (best[2], best[1], best[0]):
+            best = (x, y, z)
+    return best
+
+
 @dataclass(frozen=True)
 class _RestockContext:
     """All info a strategy may need to pick spots for a single stop."""
@@ -205,7 +285,18 @@ class BalancedStrategy(RestockStrategy):
         if scored:
             scored.sort(key=lambda s: s[0])
             return (scored[0][1], scored[0][2])
-        # Pass 2 — stable stack anywhere, no COG ranking.
+        # Pass 2 — stack ONLY on other empties. Stacking on a
+        # non-empty cargo item leaves the empty floating once that
+        # cargo gets delivered to its client (visible as repeated
+        # SETTLE events in the validator output).
+        for sid in candidates:
+            pos = _find_position_on_empties(
+                vt.items(sid), dim_x, dim_y, stack_h
+            )
+            if pos is not None:
+                return (sid, pos)
+        # Pass 3 — last resort: any stable stack. The simulator's
+        # settle pass will move the empty when its supporter goes.
         for sid in candidates:
             pos = find_position(
                 vt.items(sid),

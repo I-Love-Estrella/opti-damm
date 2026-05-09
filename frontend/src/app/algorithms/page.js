@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { api, SIM_API_BASE } from '@/lib/api';
-import TruckLoadView from '@/components/TruckLoadView';
 import StopTimeline from '@/components/StopTimeline';
 import StepPlayer from '@/components/StepPlayer';
 import ActionLog from '@/components/ActionLog';
@@ -190,6 +189,8 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
   const planInvalid = validation && !validation.summary?.is_valid;
   const physicsViolations = run?.data?.physics_violations || [];
   const hasPhysicsViolations = physicsViolations.length > 0;
+  const fit = run?.data?.fit;
+  const fitFails = fit && fit.fits === false;
 
   return (
     <section className={`algo-section${planInvalid ? ' algo-section-invalid' : ''}`}>
@@ -208,6 +209,16 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
               ⚠ {physicsViolations.length} PHYSICS
             </span>
           )}
+          {fitFails && (
+            <span className="algo-invalid-badge">
+              ⚠ TRUCK TOO SMALL
+            </span>
+          )}
+          {truck?.manual_override && (
+            <span className="algo-physics-badge" title="Truck manually overridden">
+              ⚙ MANUAL TRUCK · {truck.code}
+            </span>
+          )}
         </div>
         <button className="btn-primary" onClick={() => onRun(algo.name)} disabled={status === 'loading'}>
           {status === 'loading' ? 'Running…' : 'Run on selected day ▸'}
@@ -222,6 +233,14 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
 
       {kpis && (
         <>
+          {fitFails && (
+            <div className="algo-error" style={{ marginBottom: 12 }}>
+              <b>Truck capacity exceeded:</b>
+              <ul style={{ margin: '6px 0 0 18px' }}>
+                {fit.reasons.map((r, i) => <li key={i}>{r}</li>)}
+              </ul>
+            </div>
+          )}
           {run?.data?.validation && (
             <ValidationPanel validation={run.data.validation} />
           )}
@@ -281,25 +300,17 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
             </div>
           )}
 
-          {run?.data?.initial_cargo?.length > 0 && run?.data?.truck && (
-            <div className="viz-section">
-              <h4>Initial truck loading (after depot, before driving)</h4>
-              <TruckLoadView
-                truck={run.data.truck}
-                cargo={run.data.initial_cargo}
-                clientNames={Object.fromEntries((run.data.stops || []).map((s) => [s.client_id, s.name]))}
-              />
-            </div>
-          )}
-
           {run?.data?.stops?.some((s) => (s.stages || []).length > 0) && (
-            <div className="viz-section">
-              <h4>Per-stop unload timeline (each box is a stage)</h4>
+            <details className="viz-section viz-collapsible">
+              <summary className="viz-summary">
+                <h4>Per-stop unload timeline (each box is a stage)</h4>
+                <span className="viz-toggle" />
+              </summary>
               <StopTimeline
                 stops={run.data.stops}
                 clientNames={Object.fromEntries((run.data.stops || []).map((s) => [s.client_id, s.name]))}
               />
-            </div>
+            </details>
           )}
 
           {run?.data?.stops?.some((s) => (s.stages || []).length > 0) && run?.data?.truck && (
@@ -322,8 +333,12 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
 
 export default function AlgorithmsPage() {
   const [algorithms, setAlgorithms] = useState([]);
+  const [trucks, setTrucks] = useState([]);
   const [days, setDays] = useState([]);
   const [selected, setSelected] = useState(null); // {date, ruta}
+  const [selectedAlgo, setSelectedAlgo] = useState(null);
+  // null = let the backend auto-pick the smallest fitting truck.
+  const [selectedTruck, setSelectedTruck] = useState(null);
   const [runs, setRuns] = useState({});           // { algoName: {status, data, error} }
   const [bootError, setBootError] = useState(null);
   const [loadingBoot, setLoadingBoot] = useState(true);
@@ -332,15 +347,21 @@ export default function AlgorithmsPage() {
     let dead = false;
     (async () => {
       try {
-        const [a, d] = await Promise.all([
+        const [a, t, d] = await Promise.all([
           api.algorithms(),
+          api.trucks(),
           api.days({ minClients: 5, head: 50 }),
         ]);
         if (dead) return;
-        setAlgorithms(a.algorithms || []);
+        const algos = a.algorithms || [];
+        setAlgorithms(algos);
+        setTrucks(t.trucks || []);
         setDays(d.items || []);
         if (d.items?.length > 0) {
           setSelected({ date: d.items[0].date, ruta: d.items[0].ruta });
+        }
+        if (algos.length > 0) {
+          setSelectedAlgo(algos[0].name);
         }
       } catch (e) {
         if (dead) return;
@@ -352,32 +373,23 @@ export default function AlgorithmsPage() {
     return () => { dead = true; };
   }, []);
 
-  const baselineName = algorithms[0]?.name;
-  const baselineKpis = useMemo(
-    () => (baselineName ? runs[baselineName]?.data?.kpis : undefined),
-    [baselineName, runs]
-  );
-
-  KpiCard.baselineLabel = baselineName || 'baseline';
+  KpiCard.baselineLabel = 'baseline';
 
   const runOne = useCallback(async (algoName) => {
     if (!selected) return;
     setRuns(prev => ({ ...prev, [algoName]: { status: 'loading' } }));
     try {
-      const data = await api.run({ date: selected.date, ruta: selected.ruta, algo: algoName });
+      const data = await api.run({
+        date: selected.date,
+        ruta: selected.ruta,
+        algo: algoName,
+        truckCode: selectedTruck || undefined,
+      });
       setRuns(prev => ({ ...prev, [algoName]: { status: 'ok', data } }));
     } catch (e) {
       setRuns(prev => ({ ...prev, [algoName]: { status: 'error', error: e.message || String(e) } }));
     }
-  }, [selected]);
-
-  const runAll = useCallback(async () => {
-    if (!selected || algorithms.length === 0) return;
-    for (const a of algorithms) {
-      // sequential — keep API ordering predictable
-      await runOne(a.name);
-    }
-  }, [selected, algorithms, runOne]);
+  }, [selected, selectedTruck]);
 
   const handleDayChange = (e) => {
     const idx = parseInt(e.target.value, 10);
@@ -387,6 +399,18 @@ export default function AlgorithmsPage() {
       setRuns({});
     }
   };
+
+  const handleAlgoChange = (e) => {
+    setSelectedAlgo(e.target.value);
+  };
+
+  const handleTruckChange = (e) => {
+    const v = e.target.value;
+    setSelectedTruck(v === '' ? null : v);
+    setRuns({});
+  };
+
+  const activeAlgo = algorithms.find((a) => a.name === selectedAlgo);
 
   return (
     <div className="algo-page">
@@ -425,8 +449,33 @@ export default function AlgorithmsPage() {
             ))}
           </select>
         </div>
-        <button className="btn-primary big" onClick={runAll} disabled={!selected || algorithms.length === 0}>
-          ▶ Run all algorithms
+        <div className="control-group">
+          <label>Algorithm</label>
+          <select onChange={handleAlgoChange} value={selectedAlgo || ''} disabled={!algorithms.length}>
+            {algorithms.map((a) => (
+              <option key={a.name} value={a.name}>
+                {a.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="control-group">
+          <label>Truck</label>
+          <select onChange={handleTruckChange} value={selectedTruck || ''} disabled={!trucks.length}>
+            <option value="">auto (smallest fit)</option>
+            {trucks.map((t) => (
+              <option key={t.code} value={t.code}>
+                {t.code} — {t.pallet_capacity} plt · {t.max_weight_kg} kg
+              </option>
+            ))}
+          </select>
+        </div>
+        <button
+          className="btn-primary big"
+          onClick={() => selectedAlgo && runOne(selectedAlgo)}
+          disabled={!selected || !selectedAlgo || runs[selectedAlgo]?.status === 'loading'}
+        >
+          {runs[selectedAlgo]?.status === 'loading' ? 'Running…' : '▶ Run algorithm'}
         </button>
       </div>
 
@@ -439,20 +488,20 @@ export default function AlgorithmsPage() {
       )}
 
       <main className="algo-grid">
-        {algorithms.map(algo => (
+        {activeAlgo && (
           <AlgorithmSection
-            key={algo.name}
-            algo={algo}
-            run={runs[algo.name]}
-            baselineKpis={algo.name === baselineName ? undefined : baselineKpis}
+            key={activeAlgo.name}
+            algo={activeAlgo}
+            run={runs[activeAlgo.name]}
+            baselineKpis={undefined}
             onRun={runOne}
           />
-        ))}
+        )}
       </main>
 
       <footer className="algo-footer">
         <span>BEERANTIR · ALGORITHMS LAB · v0.1 · BUILD 2026.05.09</span>
-        <span>FIRST ALGO IS THE BASELINE · DELTAS COMPUTED VS IT</span>
+        <span>PICK A DAY AND ALGORITHM · RUN TO SEE KPIS</span>
       </footer>
     </div>
   );

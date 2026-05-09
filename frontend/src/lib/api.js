@@ -31,12 +31,13 @@ async function jsonRequest(path, init = {}) {
 
 export const api = {
   algorithms: () => jsonRequest('/api/algorithms'),
+  trucks: () => jsonRequest('/api/trucks'),
   days: ({ minClients = 5, head = 50 } = {}) =>
     jsonRequest(`/api/days?min_clients=${minClients}&head=${head}`),
-  run: ({ date, ruta, algo }) =>
+  run: ({ date, ruta, algo, truckCode }) =>
     jsonRequest('/api/run', {
       method: 'POST',
-      body: JSON.stringify({ date, ruta, algo }),
+      body: JSON.stringify({ date, ruta, algo, truck_code: truckCode }),
     }),
   bench: ({ algos, maxCases = 30, seed = 42, minClients = 5 }) =>
     jsonRequest('/api/bench', {

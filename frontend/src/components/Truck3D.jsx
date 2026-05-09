@@ -350,6 +350,56 @@ export default function Truck3D({
     return out;
   }, [palletsBySlot, totalSidePos]);
 
+  // In-hands cargo: group identical items so the row above the truck doesn't
+  // turn into a jittered cloud. Key = type + full/empty + client + sku, so
+  // distinct items stay visually separable while duplicates collapse to one
+  // representative cube with an "× N" badge.
+  const inHandsGroups = useMemo(() => {
+    const groups = new Map();
+    for (const b of boxes) {
+      if (b.status === 'delivered' || b.status === 'in_pallet') continue;
+      const key = [
+        b.physical_type || 'unit',
+        b.is_returnable_empty ? 'E' : 'F',
+        b.intended_client || '',
+        b.sku || '',
+      ].join('|');
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          key,
+          type: b.physical_type,
+          isEmpty: !!b.is_returnable_empty,
+          client: b.intended_client,
+          sku: b.sku,
+          rep: b,
+          items: [],
+        };
+        groups.set(key, g);
+      }
+      g.items.push(b);
+    }
+    return Array.from(groups.values()).sort((a, b) =>
+      (a.type || '').localeCompare(b.type || '') || (a.sku || '').localeCompare(b.sku || ''),
+    );
+  }, [boxes]);
+
+  const inHandsLayout = useMemo(() => {
+    const truckLength =
+      totalSidePos * (PALLET_LEN + SLOT_GAP_X) + 2 * TRUCK_WALL_PAD;
+    const spacing = 0.65;
+    const totalWidth = Math.max((inHandsGroups.length - 1) * spacing, 0);
+    const startX = -totalWidth / 2;
+    const rowY = PALLET_HEIGHT + 0.85;
+    const rowZ = 0;
+    return inHandsGroups.map((_, i) => ({
+      x: startX + i * spacing,
+      y: rowY,
+      z: rowZ,
+      truckLength,
+    }));
+  }, [inHandsGroups, totalSidePos]);
+
 
 
   return (
@@ -382,7 +432,7 @@ export default function Truck3D({
           {boxes.map((b) => {
             const center = slotCenters[b.slot_id];
             if (!center || !b.layout) return null;
-            if (b.status === 'delivered') return null;
+            if (b.status !== 'in_pallet') return null;
 
             // Continuous physical placement straight from the bin-packer.
             // Convert pallet-local (px, py, pz) into world-space, taking the
@@ -395,53 +445,27 @@ export default function Truck3D({
             const px = b.pos_x ?? 0;
             const py = b.pos_y ?? 0;
             const pz = b.pos_z ?? 0;
-            // World X = pallet center X + (item center along pallet length)
             const worldX = center.x + (px + (b.dim_x ?? 0) / 2 - PALLET_LEN / 2);
-            // World Z = pallet center Z + (item depth, mirrored for R side so
-            // pos_y=0 is always the truck-edge side).
             const worldZ_local = py + (b.dim_y ?? 0) / 2 - PALLET_WIDTH / 2;
             const worldZ = center.z + (b.side === 'R' ? -worldZ_local : worldZ_local);
-            // World Y = pallet floor + item height center.
             const worldY = center.y + PALLET_THICKNESS + pz + (b.dim_h ?? 0) / 2;
 
             const baseColor = b.is_returnable_empty ? '#aa66ff' : clientColor(b.intended_client);
+            const baseOpacity = b.is_returnable_empty ? 0.45 : 1;
             const isCurrentEvent =
               highlightSeq !== undefined &&
               b.history?.length > 0 &&
               b.history[b.history.length - 1].step_idx === highlightSeq;
 
-            let position;
-            let opacity = 1;
-            let emissive = isCurrentEvent ? '#ffaa00' : null;
-
-            if (b.status === 'in_pallet') {
-              position = { x: worldX, y: worldY, z: worldZ };
-            } else {
-              // in_hands — float above truck, jittered per box id
-              const idHash = parseInt(b.id.replace(/\D/g, ''), 10) || 0;
-              const xJ = ((idHash * 17) % 200 - 100) / 200;
-              const zJ = ((idHash * 23) % 200 - 100) / 200;
-              position = {
-                x: worldX + xJ * 0.4,
-                y: PALLET_HEIGHT + 0.5 + ((idHash * 11) % 70) / 100,
-                z:
-                  worldZ +
-                  (b.side === 'L' ? -1.2 : b.side === 'R' ? 1.2 : 0) +
-                  zJ * 0.3,
-              };
-              opacity = 0.92;
-              emissive = emissive || '#552200';
-            }
-
             const tmeta = typeMeta(b.physical_type);
             return (
               <CargoBox
                 key={b.id}
-                position={position}
+                position={{ x: worldX, y: worldY, z: worldZ }}
                 size={cubeSize}
                 color={baseColor}
-                opacity={opacity}
-                emissive={emissive}
+                opacity={baseOpacity}
+                emissive={isCurrentEvent ? '#ffaa00' : null}
                 isCurrentEvent={isCurrentEvent}
                 isHovered={hoveredId === b.id}
                 isSelected={selectedId === b.id}
@@ -461,6 +485,71 @@ export default function Truck3D({
                   setSelectedId((prev) => (prev === b.id ? null : b.id));
                 }}
               />
+            );
+          })}
+
+          {inHandsGroups.map((group, gi) => {
+            const pos = inHandsLayout[gi];
+            const rep = group.rep;
+            const cubeSize = {
+              len: (rep.dim_x ?? 0.20) * 0.99,
+              width: (rep.dim_y ?? 0.20) * 0.99,
+              h: (rep.dim_h ?? 0.24) * 0.99,
+            };
+            const color = group.isEmpty
+              ? '#aa66ff'
+              : clientColor(group.client);
+            const groupOpacity = group.isEmpty ? 0.5 : 0.92;
+            const tmeta = typeMeta(group.type);
+            const isCurrentEvent =
+              highlightSeq !== undefined &&
+              group.items.some(
+                (b) =>
+                  b.history?.length > 0 &&
+                  b.history[b.history.length - 1].step_idx === highlightSeq,
+              );
+            const isHovered = group.items.some((b) => b.id === hoveredId);
+            const isSelected = group.items.some((b) => b.id === selectedId);
+            const repId = rep.id;
+
+            return (
+              <group key={group.key} position={[pos.x, pos.y, pos.z]}>
+                <CargoBox
+                  position={{ x: 0, y: 0, z: 0 }}
+                  size={cubeSize}
+                  color={color}
+                  opacity={groupOpacity}
+                  emissive={isCurrentEvent ? '#ffaa00' : '#552200'}
+                  isCurrentEvent={isCurrentEvent}
+                  isHovered={isHovered}
+                  isSelected={isSelected}
+                  typeCode={tmeta.code}
+                  typeColor={tmeta.color}
+                  showLabel={showTypeLabels}
+                  onPointerOver={(e) => {
+                    e.stopPropagation();
+                    setHoveredId(repId);
+                  }}
+                  onPointerOut={(e) => {
+                    e.stopPropagation();
+                    setHoveredId((prev) => (prev === repId ? null : prev));
+                  }}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    setSelectedId((prev) => (prev === repId ? null : repId));
+                  }}
+                />
+                <Html
+                  position={[cubeSize.len / 2 + 0.08, cubeSize.h / 2 + 0.08, 0]}
+                  center
+                  distanceFactor={5}
+                  style={{ pointerEvents: 'none' }}
+                >
+                  <div className="r3d-count-badge">
+                    ×{group.items.length}
+                  </div>
+                </Html>
+              </group>
             );
           })}
 

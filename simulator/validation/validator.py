@@ -450,18 +450,23 @@ _PHYSICS_CODE_MAP = {
     "FLOATING": "FLOATING_ITEM",
     "UNSTABLE_OVERHANG": "UNSTABLE_OVERHANG",
     "HEIGHT_OVERFLOW": "PALLET_HEIGHT_EXCEEDS_TRUCK",
-    # When the simulator detects an algorithm-supplied position would
-    # overlap and snaps to a clean spot (or drops the empty), surface
-    # it as an OVERLAP error too — the algorithm is buggy even if the
-    # final state is clean.
-    "PICKUP_OVERLAP_SNAPPED": "OVERLAP",
-    "RESTOCK_OVERLAP_SNAPPED": "OVERLAP",
+    # Self-corrected events — the algorithm asked for an invalid
+    # position but the simulator snapped/settled it to a clean one.
+    # These get distinct codes (so they're easy to filter) and
+    # WARNING severity since the final cargo state is physically
+    # valid. The algorithm bug is still visible to anyone reading
+    # the warnings list.
+    "PICKUP_OVERLAP_SNAPPED": "OVERLAP_AVOIDED",
+    "RESTOCK_OVERLAP_SNAPPED": "OVERLAP_AVOIDED",
+    "SETTLE": "FLOATING_AVOIDED",
+    # Genuine loss — empty couldn't be placed and was dropped. Stays
+    # ERROR because the truck loses track of a returnable.
     "PICKUP_DROPPED_NO_FIT": "OVERLAP",
-    # Item left floating after the supporter was delivered, and the
-    # simulator dropped it to a supported anchor. Surface as
-    # FLOATING_ITEM so the algorithm bug stays visible.
-    "SETTLE": "FLOATING_ITEM",
 }
+
+# Validator codes whose severity is WARNING (sub-optimal but
+# auto-corrected) rather than ERROR (truly invalid plan state).
+_WARNING_CODES = {"OVERLAP_AVOIDED", "FLOATING_AVOIDED"}
 
 
 def _check_runtime_physics(result: SimulationResult) -> list[ValidationIssue]:
@@ -493,10 +498,16 @@ def _check_runtime_physics(result: SimulationResult) -> list[ValidationIssue]:
             continue
         seen.add(key)
         msg = str(rec.get("message") or f"Physics violation: {code}")
-        _print_error(f"runtime {code}: {msg}")
+        severity = (
+            ValidationSeverity.WARNING
+            if validator_code in _WARNING_CODES
+            else ValidationSeverity.ERROR
+        )
+        if severity == ValidationSeverity.ERROR:
+            _print_error(f"runtime {code}: {msg}")
         out.append(
             ValidationIssue(
-                severity=ValidationSeverity.ERROR,
+                severity=severity,
                 code=validator_code,
                 message=msg,
                 where=str(rec.get("where") or "runtime"),
@@ -674,9 +685,19 @@ def _check_cargo(case: DayCase, state: WorldState) -> list[ValidationIssue]:
                     )
                 )
 
-            # Crush risk + glass-under-heavy.
-            sorted_items = sorted(items, key=lambda x: x.bottom_level)
+            # Crush risk + glass-under-heavy. Uses CONTINUOUS xy-overlap
+            # (not legacy col_x/col_y bins) so we only flag pairs whose
+            # footprints actually touch — discrete bins were producing
+            # false positives for items that share a legacy column index
+            # but don't physically rest on each other.
+            sorted_items = sorted(items, key=lambda x: x.pos_z)
             for lower, upper in zip(sorted_items, sorted_items[1:]):
+                if upper.pos_z + OVERLAP_EPS_M < lower.top_z:
+                    continue  # not actually stacked
+                ox = max(0.0, min(lower.end_x, upper.end_x) - max(lower.pos_x, upper.pos_x))
+                oy = max(0.0, min(lower.end_y, upper.end_y) - max(lower.pos_y, upper.pos_y))
+                if ox <= OVERLAP_EPS_M or oy <= OVERLAP_EPS_M:
+                    continue  # no physical xy overlap
                 lower_w = float(lower.unit_weight_kg)
                 upper_w = float(upper.unit_weight_kg)
                 if (

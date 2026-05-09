@@ -88,6 +88,55 @@ W_NEW_STACK = 1.5
 _BBOX_EPS = 1e-6
 
 
+def _find_position_safe(items, chunk):
+    """Strict packing with progressive fallbacks. Returns (pos, tier).
+    Heavy items (>5 kg/unit) NEVER cross the no-crush guarantee — if
+    no non-crushing anchor is available in a slot, that slot returns
+    None and the algorithm tries another slot (or an empty one).
+    Light items keep the older relaxation path because the crush
+    rule doesn't apply to them anyway."""
+
+    base = dict(
+        dim_x=chunk.unit_dim_x,
+        dim_y=chunk.unit_dim_y,
+        dim_h=chunk.stack_h,
+        enforce_pallet_height=True,
+        aspect_limit=STACK_RATIO,
+        unit_weight_kg=chunk.unit_weight_kg,
+    )
+
+    is_heavy = chunk.unit_weight_kg >= 5.0
+
+    # 1. Strict — require ≥50% support and no crush.
+    pos = find_position(items, **base, require_support=True, avoid_crush=True)
+    if pos is not None:
+        return pos, 1
+    # 2. Relax support to "at least touching" — but KEEP no-crush for
+    # heavy chunks. For light chunks crush is irrelevant.
+    pos = find_position(
+        items, **base,
+        require_support=True,
+        min_support_fraction=0.001,
+        avoid_crush=is_heavy,
+        prefer_max_support=True,
+    )
+    if pos is not None:
+        return pos, 2
+    # 3. Light items only — relax support to any positive coverage.
+    # Heavy items refuse a slot rather than risk crush.
+    if not is_heavy:
+        pos = find_position(
+            items, **base,
+            require_support=True,
+            min_support_fraction=0.001,
+            avoid_crush=False,
+            prefer_max_support=True,
+        )
+        if pos is not None:
+            return pos, 3
+    return None, 0
+
+
 # ---- Internal types ----------------------------------------------------------
 
 
@@ -203,6 +252,32 @@ class BalancedLoader(Algorithm):
             s.slot_id: _SlotState(slot_id=s.slot_id, slot=s) for s in slots
         }
 
+        # Dedicate ONE slot for empties (returnables) — but only if
+        # the truck has enough room. When orders fill ≥80% of the
+        # remaining slots' nominal capacity, reserving a slot would
+        # force cargo drops; in that case we share the slot.
+        empties_slot = self._choose_empties_slot(slots)
+        if empties_slot is not None:
+            # Estimate cargo volume vs available cargo capacity if
+            # we kept the slot reserved.
+            cargo_volume = 0.0
+            for o in case.orders:
+                for line in o.lines:
+                    cargo_volume += line.qty * line.unit_volume_m3
+            from simulator.config import PALLET_VOLUME_M3
+            avail_with_reserve = (len(slots) - 1) * PALLET_VOLUME_M3
+            if avail_with_reserve > 0 and cargo_volume / avail_with_reserve > 0.80:
+                rationale.append(
+                    f"Cargo volume {cargo_volume:.1f} m³ ≥ 80% of {avail_with_reserve:.1f} m³ "
+                    f"with reserve — releasing empties slot for cargo."
+                )
+                empties_slot = None
+            else:
+                rationale.append(
+                    f"Reserved slot {empties_slot} for returnable empties "
+                    "— cargo is never loaded here."
+                )
+
         loading_order = list(reversed(route))
         rationale.append(
             "Loading: reverse delivery order — last visit is loaded first."
@@ -230,7 +305,19 @@ class BalancedLoader(Algorithm):
             )
             for unit in units:
                 for chunk in self._split_chunks(unit):
-                    target = self._pick_best_slot(chunk, slot_states, case.truck)
+                    # 1st pass: try to fit without touching the empties
+                    # slot. 2nd pass (if 1st failed): allow the empties
+                    # slot too — better to ship the cargo than reserve
+                    # space we won't use. Empties get a fallback slot
+                    # at pickup time.
+                    target = self._pick_best_slot(
+                        chunk, slot_states, case.truck,
+                        forbidden=empties_slot,
+                    )
+                    if target is None and empties_slot is not None:
+                        target = self._pick_best_slot(
+                            chunk, slot_states, case.truck, forbidden=None
+                        )
                     if target is None:
                         overflow.append(
                             (chunk.client_id, chunk.sku, chunk.qty, "no fit")
@@ -248,7 +335,10 @@ class BalancedLoader(Algorithm):
                 f"OVERFLOW: {len(overflow)} chunks did not fit (dropped at delivery)."
             )
 
-        cmds = self._emit_commands(case, route, slots, slot_states, delivery_slots)
+        cmds = self._emit_commands(
+            case, route, slots, slot_states, delivery_slots,
+            empties_slot=empties_slot,
+        )
 
         return Plan(
             algorithm=self.name,
@@ -402,9 +492,12 @@ class BalancedLoader(Algorithm):
         chunk: _LoadUnit,
         slot_states: dict[str, _SlotState],
         truck,
+        forbidden: str | None = None,
     ) -> _SlotState | None:
         best: tuple[float, _SlotState] | None = None
         for state in slot_states.values():
+            if forbidden is not None and state.slot_id == forbidden:
+                continue
             evaluated = self._evaluate_candidate(chunk, state, slot_states, truck)
             if evaluated is None:
                 continue
@@ -412,6 +505,28 @@ class BalancedLoader(Algorithm):
             if best is None or score < best[0]:
                 best = (score, state)
         return best[1] if best else None
+
+    @staticmethod
+    def _choose_empties_slot(slots) -> str | None:
+        """Pick a single slot to dedicate exclusively to returnable
+        empties. Strategy: prefer the back ('B') slot if the truck
+        has one; otherwise pick the deepest right-side slot
+        ('Rmax_pos'). Falls back to the deepest slot of any side.
+        Returns None if there's nothing to dedicate (single-slot
+        truck — extremely rare)."""
+
+        if not slots or len(slots) <= 1:
+            return None
+        # Back slot first.
+        for s in slots:
+            if s.side == "B":
+                return s.slot_id
+        # Deepest right-side slot.
+        right_slots = [s for s in slots if s.side == "R"]
+        if right_slots:
+            return max(right_slots, key=lambda s: s.position).slot_id
+        # Last resort — deepest slot regardless of side.
+        return max(slots, key=lambda s: s.position).slot_id
 
     def _evaluate_candidate(
         self,
@@ -423,14 +538,7 @@ class BalancedLoader(Algorithm):
         if state.is_empty:
             if chunk.weight_kg > PALLET_MAX_WEIGHT_KG:
                 return None
-            pos = find_position(
-                [],
-                chunk.unit_dim_x,
-                chunk.unit_dim_y,
-                chunk.stack_h,
-                enforce_pallet_height=True,
-                aspect_limit=STACK_RATIO,
-            )
+            pos, tier = _find_position_safe([], chunk)
             if pos is None:
                 return None
             opens_stack = True
@@ -442,18 +550,11 @@ class BalancedLoader(Algorithm):
                 return None
             if state.weight_kg + chunk.weight_kg > PALLET_MAX_WEIGHT_KG:
                 return None
-            pos = find_position(
-                state.items,
-                chunk.unit_dim_x,
-                chunk.unit_dim_y,
-                chunk.stack_h,
-                enforce_pallet_height=True,
-                aspect_limit=STACK_RATIO,
-            )
+            pos, tier = _find_position_safe(state.items, chunk)
             if pos is None:
                 return None
             opens_stack = self._is_new_stack(state.items, pos)
-        return self._score(chunk, state, pos, slot_states, truck, opens_stack)
+        return self._score(chunk, state, pos, slot_states, truck, opens_stack, tier)
 
     @staticmethod
     def _is_new_stack(items: list[PalletItem], pos: tuple[float, float, float]) -> bool:
@@ -477,6 +578,7 @@ class BalancedLoader(Algorithm):
         slot_states: dict[str, _SlotState],
         truck,
         opens_stack: bool,
+        tier: int,
     ) -> float:
         total_w = 0.0
         sx = 0.0
@@ -513,12 +615,23 @@ class BalancedLoader(Algorithm):
         else:
             locality = W_NEW_SLOT
 
+        # Tier penalty — strongly prefer slots where a strict-valid
+        # placement exists. Higher tier = more relaxed constraints.
+        tier_penalty = 0.0
+        if tier == 2:
+            tier_penalty = 50.0
+        elif tier == 3:
+            tier_penalty = 200.0
+        elif tier == 4:
+            tier_penalty = 1000.0  # very last resort
+
         return (
             balance_pen
             + W_HEIGHT * height_ratio
             + W_LAYER * layer_penalty
             + W_CENTER * center_dist
             + locality
+            + tier_penalty
         )
 
     @staticmethod
@@ -553,14 +666,7 @@ class BalancedLoader(Algorithm):
 
         state.client_set.add(chunk.client_id)
 
-        pos = find_position(
-            state.items,
-            chunk.unit_dim_x,
-            chunk.unit_dim_y,
-            chunk.stack_h,
-            enforce_pallet_height=True,
-            aspect_limit=STACK_RATIO,
-        )
+        pos, _tier = _find_position_safe(state.items, chunk)
         if pos is None:
             # _evaluate_candidate already screened this slot, so we
             # shouldn't get here. If we do, refuse the placement instead
@@ -612,6 +718,7 @@ class BalancedLoader(Algorithm):
         slots: list[Slot],
         slot_states: dict[str, _SlotState],
         delivery_slots: dict[tuple[str, str], list[tuple[str, float]]],
+        empties_slot: str | None = None,
     ) -> list[Command]:
         cmds: list[Command] = []
 
@@ -716,15 +823,35 @@ class BalancedLoader(Algorithm):
                     first = False
                 vt.apply_restock(slot_id, restock, target_items, same_client, foreign)
             if o.expected_returnable_units > 0:
-                ret_slot = self._return_slot(o.client_id, slot_states, vt)
-                keg_compatible = [
-                    s.slot_id for s in slots
-                    if slot_states[s.slot_id].pallet_class
-                    in (None, PalletClass.KEG)
-                ]
-                candidates = keg_compatible or [s.slot_id for s in slots]
-                if ret_slot not in candidates:
-                    ret_slot = candidates[0]
+                # Empties always land in the dedicated empties slot.
+                # That slot has no cargo (reserved at plan time), so
+                # the floor is always available and the simulator's
+                # snap/settle paths almost never trigger.
+                if empties_slot is not None:
+                    ret_slot = empties_slot
+                    # Empties slot is the primary target. If high-
+                    # volume days forced cargo into it, also offer
+                    # other keg-compatible slots as fallback so we
+                    # don't drop empties.
+                    empties_state = slot_states[empties_slot]
+                    candidates = [empties_slot]
+                    if not empties_state.is_empty:
+                        candidates.extend(
+                            s.slot_id for s in slots
+                            if s.slot_id != empties_slot
+                            and slot_states[s.slot_id].pallet_class
+                            in (None, PalletClass.KEG)
+                        )
+                else:
+                    ret_slot = self._return_slot(o.client_id, slot_states, vt)
+                    keg_compatible = [
+                        s.slot_id for s in slots
+                        if slot_states[s.slot_id].pallet_class
+                        in (None, PalletClass.KEG)
+                    ]
+                    candidates = keg_compatible or [s.slot_id for s in slots]
+                    if ret_slot not in candidates:
+                        ret_slot = candidates[0]
                 # COG-aware strategy: among floor-eligible candidates,
                 # pick the one that keeps the truck centre of mass
                 # closest to (0.52, 0.50).

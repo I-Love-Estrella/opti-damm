@@ -2,6 +2,7 @@
 
 from simulator.algorithms.balanced import BalancedLoader
 from simulator.algorithms.base import Algorithm
+from simulator.algorithms.historic import HistoricMimic
 from simulator.algorithms.lifo import LifoArchitect
 from simulator.algorithms.nearest import NearestNeighborSmart
 from simulator.algorithms.replay import ReplayBaseline
@@ -12,6 +13,7 @@ REGISTRY: dict[str, type[Algorithm]] = {
     "nearest": NearestNeighborSmart,
     "balanced": BalancedLoader,
     "lifo": LifoArchitect,
+    "historic": HistoricMimic,
 }
 
 

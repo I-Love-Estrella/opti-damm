@@ -147,6 +147,14 @@ class PickupReturn:
     dim_x: float = 0.0
     dim_y: float = 0.0
     dim_h: float = 0.0
+    # Type of empty being picked up. Drives visual rendering and the
+    # crush/stability checks the simulator runs against the resulting
+    # PalletItem. Defaults to "keg" so older plans keep working
+    # unchanged. Algorithms that pick up empty cases / bottles should
+    # set this explicitly.
+    physical_type: str = "keg"
+    unit_weight_kg: float = 2.0  # empty keg ≈ 2 kg
+    unit_volume_m3: float = 0.04
 
 
 @dataclass(frozen=True)

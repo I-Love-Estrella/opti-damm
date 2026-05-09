@@ -8,6 +8,7 @@ import TruckLoadView from '@/components/TruckLoadView';
 import StopTimeline from '@/components/StopTimeline';
 import StepPlayer from '@/components/StepPlayer';
 import ActionLog from '@/components/ActionLog';
+import ValidationPanel from '@/components/ValidationPanel';
 import { cargoStateAt, flattenStages, buildLiftReplaceMap } from '@/lib/cargoState';
 import './algorithms.css';
 
@@ -124,14 +125,21 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
   const status = run?.status || 'idle';
   const kpis = run?.data?.kpis;
   const truck = run?.data?.truck;
+  const validation = run?.data?.validation;
+  const planInvalid = validation && !validation.summary?.is_valid;
 
   return (
-    <section className="algo-section">
+    <section className={`algo-section${planInvalid ? ' algo-section-invalid' : ''}`}>
       <header className="algo-header">
         <div className="algo-headline">
           <span className="algo-tag">ALGO</span>
           <h2 className="algo-name">{algo.name}</h2>
           <StatusPill status={status} />
+          {planInvalid && (
+            <span className="algo-invalid-badge">
+              ✕ INVALID — {validation.summary.errors} error(s)
+            </span>
+          )}
         </div>
         <button className="btn-primary" onClick={() => onRun(algo.name)} disabled={status === 'loading'}>
           {status === 'loading' ? 'Running…' : 'Run on selected day ▸'}
@@ -146,6 +154,10 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
 
       {kpis && (
         <>
+          {run?.data?.validation && (
+            <ValidationPanel validation={run.data.validation} />
+          )}
+
           <div className="algo-meta">
             <span><b>Truck:</b> {truck?.code} · {truck?.pallet_capacity} plt · {truck?.max_weight_kg} kg</span>
             <span><b>Clients:</b> {kpis.n_clients_visited}/{kpis.n_clients_planned}</span>

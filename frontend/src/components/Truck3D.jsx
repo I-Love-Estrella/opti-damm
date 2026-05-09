@@ -2,7 +2,9 @@
 
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Edges, Html } from '@react-three/drei';
-import { Component, useMemo } from 'react';
+import { Component, useMemo, useState } from 'react';
+import * as THREE from 'three';
+import { PHYSICAL_TYPES, typeMeta } from '@/lib/physicalType';
 
 const PALLET_LEN = 1.2;
 const PALLET_WIDTH = 0.8;
@@ -11,6 +13,23 @@ const PALLET_THICKNESS = 0.12;
 const SLOT_GAP_X = 0.06;
 const TRUCK_WALL_PAD = 0.10;
 const TRUCK_FLOOR_THICKNESS = 0.05;
+
+// Per-type physical height in metres. X/Z stay cell-based (no overlap with
+// neighbouring columns), but height makes the type visible at a glance:
+// kegs are tall, cans are short, bulk is double-tall.
+const TYPE_HEIGHT_M = {
+  keg:    0.65,   // 30L / 50L beer keg — tallest of the regular cargo
+  case:   0.30,   // beer case 24×33CL
+  bottle: 0.42,   // standalone large bottle
+  can:    0.16,   // single can — very short
+  bulk:   1.50,   // whole pallet item — almost truck-tall
+  weight: 0.30,   // weight bag/box
+  unit:   0.24,   // generic unit
+};
+
+function typeHeight(t) {
+  return TYPE_HEIGHT_M[t] ?? TYPE_HEIGHT_M.unit;
+}
 
 function clientColor(id) {
   if (!id) return '#6e6e6e';
@@ -67,32 +86,112 @@ function cellWorld(palletCenter, side, layout, colX, colY, level) {
   };
 }
 
-function CargoBox({ position, size, color, opacity = 1, emissive, isHovered, label }) {
+// Letter textures — one per type code, cached so we never rebuild canvases.
+// Texture is a square with a transparent background and a single black glyph;
+// the body colour comes from the material's `color` so the same texture works
+// for every cube of the same type.
+const _letterTextureCache = new Map();
+function getLetterTexture(code) {
+  if (_letterTextureCache.has(code)) return _letterTextureCache.get(code);
+  const SIZE = 256;
+  const canvas = (typeof document !== 'undefined') ? document.createElement('canvas') : null;
+  if (!canvas) return null;
+  canvas.width = SIZE;
+  canvas.height = SIZE;
+  const ctx = canvas.getContext('2d');
+  // White background — multiplies with material.color, so the body keeps its
+  // colour everywhere except inside the glyph.
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, SIZE, SIZE);
+  ctx.fillStyle = '#000000';
+  ctx.font = 'bold 200px ui-monospace, "SFMono-Regular", Menlo, monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(code, SIZE / 2, SIZE / 2 + 8);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  _letterTextureCache.set(code, tex);
+  return tex;
+}
+
+function CargoBox({
+  position,
+  size,
+  color,
+  opacity = 1,
+  emissive,
+  isCurrentEvent,
+  isHovered,
+  isSelected,
+  typeCode,
+  typeColor,
+  showLabel,
+  onPointerOver,
+  onPointerOut,
+  onPointerDown,
+}) {
+  // Edge / emissive priority: selected > hovered > current event > default.
+  let edgeColor = '#000000';
+  let edgeWidth = 1.5;
+  let activeEmissive = emissive || null;
+  let emissiveIntensity = emissive ? 0.45 : 0;
+  if (isSelected) {
+    edgeColor = '#ffffff';
+    edgeWidth = 3.5;
+    activeEmissive = '#ffffff';
+    emissiveIntensity = 0.55;
+  } else if (isHovered) {
+    edgeColor = '#fc0';
+    edgeWidth = 2.5;
+    activeEmissive = '#665500';
+    emissiveIntensity = 0.4;
+  } else if (isCurrentEvent) {
+    edgeColor = '#ffaa00';
+    edgeWidth = 2.0;
+    activeEmissive = '#ffaa00';
+    emissiveIntensity = 0.5;
+  }
+
+  // Letter is baked into the face texture so it appears on the cube surface
+  // itself. Faces 0/+X, 1/-X, 4/+Z, 5/-Z and 2/+Y get the letter; 3/-Y (bottom)
+  // stays clean.
+  const letterTex = showLabel && typeCode ? getLetterTexture(typeCode) : null;
+  const matBase = {
+    color,
+    transparent: opacity < 1,
+    opacity,
+    emissive: activeEmissive || '#000000',
+    emissiveIntensity,
+    roughness: 0.6,
+    metalness: 0.05,
+  };
+
+  const meshKey = `${typeCode || 'x'}-${letterTex ? 'on' : 'off'}`;
+
   return (
     <group position={[position.x, position.y, position.z]}>
-      <mesh>
+      <mesh
+        key={meshKey}
+        onPointerOver={onPointerOver}
+        onPointerOut={onPointerOut}
+        onPointerDown={onPointerDown}
+      >
         <boxGeometry args={[size.len, size.h, size.width]} />
-        <meshStandardMaterial
-          color={color}
-          transparent={opacity < 1}
-          opacity={opacity}
-          emissive={emissive || '#000000'}
-          emissiveIntensity={emissive ? 0.45 : 0}
-          roughness={0.6}
-          metalness={0.05}
-        />
-        <Edges color={isHovered ? '#ffffff' : '#000000'} threshold={1} lineWidth={1.5} />
+        {/* +X */}
+        <meshStandardMaterial attach="material-0" {...matBase} map={letterTex || null} />
+        {/* -X */}
+        <meshStandardMaterial attach="material-1" {...matBase} map={letterTex || null} />
+        {/* +Y (top) */}
+        <meshStandardMaterial attach="material-2" {...matBase} map={letterTex || null} />
+        {/* -Y (bottom) — no letter */}
+        <meshStandardMaterial attach="material-3" {...matBase} />
+        {/* +Z */}
+        <meshStandardMaterial attach="material-4" {...matBase} map={letterTex || null} />
+        {/* -Z */}
+        <meshStandardMaterial attach="material-5" {...matBase} map={letterTex || null} />
+        <Edges color={edgeColor} threshold={1} lineWidth={edgeWidth} />
       </mesh>
-      {label && (
-        <Html
-          position={[0, size.h / 2 + 0.06, 0]}
-          center
-          distanceFactor={6}
-          style={{ pointerEvents: 'none' }}
-        >
-          <div className="r3d-label">{label}</div>
-        </Html>
-      )}
     </group>
   );
 }
@@ -143,6 +242,55 @@ function TruckShell({ totalSidePos }) {
   );
 }
 
+function BoxDetailsCard({ box, pinned, onClose }) {
+  const tmeta = typeMeta(box.physical_type);
+  const last = box.history?.[box.history.length - 1];
+  const fields = [
+    ['SKU', box.sku],
+    ['Type', `${tmeta.code} · ${tmeta.label}`],
+    ['Quantity (per box)', Number(box.qty).toFixed(2)],
+    ['Intended client', box.intended_client || '—'],
+    ['Slot', box.slot_id],
+    ['Column', `(${box.col_x}, ${box.col_y})`],
+    ['Level', box.level],
+    ['Status', box.status],
+    ['Returnable empty', box.is_returnable_empty ? 'yes' : 'no'],
+    ['Stack member', `${(box.stack_member_idx ?? 0) + 1} / ${box.stack_member_total ?? 1}`],
+  ];
+
+  return (
+    <div className={`truck3d-details${pinned ? ' truck3d-details-pinned' : ''}`}>
+      <div className="td-head">
+        <span className="td-tag" style={{ background: tmeta.color }}>{tmeta.code}</span>
+        <span className="td-title">{box.sku}</span>
+        <span className="td-pin">{pinned ? 'pinned' : 'hover'}</span>
+        {pinned && (
+          <button className="td-close" onClick={onClose} type="button" title="Close">
+            ✕
+          </button>
+        )}
+      </div>
+      <div className="td-body">
+        {fields.map(([k, v]) => (
+          <div className="td-row" key={k}>
+            <span className="td-key">{k}</span>
+            <span className="td-val">{String(v)}</span>
+          </div>
+        ))}
+        {last && (
+          <div className="td-row">
+            <span className="td-key">Last event</span>
+            <span className="td-val">
+              {last.kind} @ step {last.step_idx + 1} (+{(last.time_min || 0).toFixed(2)}m)
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 class CanvasErrorBoundary extends Component {
   constructor(props) {
     super(props);
@@ -175,6 +323,16 @@ export default function Truck3D({
   highlightSeq,
   height = 460,
 }) {
+  const [showTypeLabels, setShowTypeLabels] = useState(true);
+  const [hoveredId, setHoveredId] = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
+
+  const activeId = selectedId || hoveredId;
+  const activeBox = useMemo(
+    () => boxes.find((b) => b.id === activeId) || null,
+    [boxes, activeId],
+  );
+
   const totalSidePos = useMemo(() => {
     let max = 0;
     for (const slotId of Object.keys(palletsBySlot)) {
@@ -191,6 +349,8 @@ export default function Truck3D({
     }
     return out;
   }, [palletsBySlot, totalSidePos]);
+
+
 
   return (
     <div className="truck3d-wrap" style={{ height }}>
@@ -224,12 +384,25 @@ export default function Truck3D({
             if (!center || !b.layout) return null;
             if (b.status === 'delivered') return null;
 
-            const cell = cellWorld(center, b.side, b.layout, b.col_x, b.col_y, b.level);
+            // Continuous physical placement straight from the bin-packer.
+            // Convert pallet-local (px, py, pz) into world-space, taking the
+            // pallet's position and L/R orientation (col_y=0 is the door edge).
             const cubeSize = {
-              len: cell.cellLen * 0.99,
-              width: cell.cellWidth * 0.99,
-              h: cell.cellH * 0.99,
+              len: (b.dim_x ?? 0.20) * 0.99,
+              width: (b.dim_y ?? 0.20) * 0.99,
+              h: (b.dim_h ?? 0.24) * 0.99,
             };
+            const px = b.pos_x ?? 0;
+            const py = b.pos_y ?? 0;
+            const pz = b.pos_z ?? 0;
+            // World X = pallet center X + (item center along pallet length)
+            const worldX = center.x + (px + (b.dim_x ?? 0) / 2 - PALLET_LEN / 2);
+            // World Z = pallet center Z + (item depth, mirrored for R side so
+            // pos_y=0 is always the truck-edge side).
+            const worldZ_local = py + (b.dim_y ?? 0) / 2 - PALLET_WIDTH / 2;
+            const worldZ = center.z + (b.side === 'R' ? -worldZ_local : worldZ_local);
+            // World Y = pallet floor + item height center.
+            const worldY = center.y + PALLET_THICKNESS + pz + (b.dim_h ?? 0) / 2;
 
             const baseColor = b.is_returnable_empty ? '#aa66ff' : clientColor(b.intended_client);
             const isCurrentEvent =
@@ -242,17 +415,17 @@ export default function Truck3D({
             let emissive = isCurrentEvent ? '#ffaa00' : null;
 
             if (b.status === 'in_pallet') {
-              position = { x: cell.x, y: cell.y, z: cell.z };
+              position = { x: worldX, y: worldY, z: worldZ };
             } else {
               // in_hands — float above truck, jittered per box id
               const idHash = parseInt(b.id.replace(/\D/g, ''), 10) || 0;
               const xJ = ((idHash * 17) % 200 - 100) / 200;
               const zJ = ((idHash * 23) % 200 - 100) / 200;
               position = {
-                x: cell.x + xJ * 0.4,
+                x: worldX + xJ * 0.4,
                 y: PALLET_HEIGHT + 0.5 + ((idHash * 11) % 70) / 100,
                 z:
-                  cell.z +
+                  worldZ +
                   (b.side === 'L' ? -1.2 : b.side === 'R' ? 1.2 : 0) +
                   zJ * 0.3,
               };
@@ -260,6 +433,7 @@ export default function Truck3D({
               emissive = emissive || '#552200';
             }
 
+            const tmeta = typeMeta(b.physical_type);
             return (
               <CargoBox
                 key={b.id}
@@ -268,7 +442,24 @@ export default function Truck3D({
                 color={baseColor}
                 opacity={opacity}
                 emissive={emissive}
-                isHovered={isCurrentEvent}
+                isCurrentEvent={isCurrentEvent}
+                isHovered={hoveredId === b.id}
+                isSelected={selectedId === b.id}
+                typeCode={tmeta.code}
+                typeColor={tmeta.color}
+                showLabel={showTypeLabels}
+                onPointerOver={(e) => {
+                  e.stopPropagation();
+                  setHoveredId(b.id);
+                }}
+                onPointerOut={(e) => {
+                  e.stopPropagation();
+                  setHoveredId((prev) => (prev === b.id ? null : prev));
+                }}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  setSelectedId((prev) => (prev === b.id ? null : b.id));
+                }}
               />
             );
           })}
@@ -286,6 +477,36 @@ export default function Truck3D({
           />
         </Canvas>
       </CanvasErrorBoundary>
+      {activeBox && (
+        <BoxDetailsCard
+          box={activeBox}
+          pinned={!!selectedId}
+          onClose={() => {
+            setSelectedId(null);
+            setHoveredId(null);
+          }}
+        />
+      )}
+      <div className="truck3d-toplabels">
+        <button
+          type="button"
+          onClick={() => setShowTypeLabels((v) => !v)}
+          className="truck3d-flag"
+          aria-pressed={!showTypeLabels}
+          title={showTypeLabels ? 'Raise flag — hide type badges' : 'Lower flag — show type badges'}
+        >
+          <span className="flag-icon">{showTypeLabels ? '🏳️' : '🚩'}</span>
+          <span>{showTypeLabels ? 'badges visible' : 'badges hidden'}</span>
+        </button>
+        <div className="truck3d-typekey">
+          {Object.entries(PHYSICAL_TYPES).map(([k, m]) => (
+            <span className="chip" key={k}>
+              <span className="dot" style={{ background: m.color }}>{m.code}</span>
+              {m.label}
+            </span>
+          ))}
+        </div>
+      </div>
       <div className="truck3d-legend">
         <span>Drag to rotate · scroll to zoom · right-drag to pan</span>
         <span><span className="sw" style={{ background: '#fc0' }} /> floating boxes = in driver's hands</span>

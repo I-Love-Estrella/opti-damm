@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef } from 'react';
+import { typeMeta } from '@/lib/physicalType';
 
 const KIND_META = {
   ARRIVE:           { icon: '⮕', label: 'Arrive',           tone: 'info'    },
@@ -200,6 +201,18 @@ export default function StepPlayer({
             </div>
             <div className="sp-card-body">
               <div className="sp-card-desc">{current.description}</div>
+              {current.detail?.physical_type && (
+                <div className="sp-card-detail">
+                  <b>Box type</b>{' '}
+                  <span
+                    className="sp-type-pill"
+                    style={{ background: typeMeta(current.detail.physical_type).color }}
+                  >
+                    {typeMeta(current.detail.physical_type).code}
+                  </span>{' '}
+                  {typeMeta(current.detail.physical_type).label}
+                </div>
+              )}
               {current.detail?.intended_client && (
                 <div className="sp-card-detail">
                   <b>Box belongs to client</b> {current.detail.intended_client}

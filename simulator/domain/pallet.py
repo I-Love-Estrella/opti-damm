@@ -1,27 +1,23 @@
-"""Pallet and item models — discrete grid model.
+"""Pallet and item models — continuous 3D positioning.
 
-Physical model
---------------
-A pallet is one of two classes, set when the first item is picked onto it:
+Each PalletItem is an axis-aligned bounding box (AABB) inside the pallet.
+The item is positioned by its bottom-left-front corner (pos_x, pos_y, pos_z)
+in metres from the pallet origin, with extents (dim_x, dim_y, dim_h).
 
-  * KEG pallet — 2×2 columns × max 4 levels  (4 columns, 16 keg cells max)
-  * BOX pallet — 4×3 columns × max 6 levels  (12 columns, 72 box cells max)
+Pallet corner system:
+  X axis — along the long pallet side (1.20 m).
+  Y axis — depth: 0 at the truck-edge side, increasing toward the cab.
+  Z axis — height: 0 at the pallet floor, up.
 
-A column holds a vertical stack of homogeneous-class units (kegs or boxes).
-Items are dropped into the column with the lowest current top; the new item
-sits on top of whatever is already there.
+Pallet.suggest_position(dim_x, dim_y, dim_h) runs a greedy "extreme points"
+3D bin-packer: it tests anchor points at the corners of currently-loaded items
+plus (0, 0, 0), and picks the lowest valid (z, y, x) anchor with no AABB
+overlap. This lets small items (cans, units) tuck into gaps left by larger
+ones (kegs, bulk) instead of wasting a full cell.
 
-A PalletItem occupies a contiguous range of levels [bottom_level .. top_level]
-in a single (col_x, col_y) column. Its `stack_size` = ceil(qty), so qty=24
-takes 24 cells stacked vertically (or as many as fit; overflow is allowed
-but counts as a capacity violation downstream).
-
-Search-moves
-------------
-To reach an item I in column (cx, cy) at levels [I.bottom .. I.top], the
-driver must remove every unit physically above I.top in the same column.
-Same-client units above are "free" (they'd be unloaded at this stop anyway).
-Foreign-client units cost 1 search-move per unit.
+Legacy discrete fields (col_x, col_y, bottom_level, stack_size) are exposed as
+properties derived from the continuous position so the existing event log,
+validator and frontend keep working without churn.
 """
 
 from __future__ import annotations
@@ -34,6 +30,14 @@ from math import ceil
 PALLET_LENGTH_M = 1.20
 PALLET_WIDTH_M = 0.80
 PALLET_HEIGHT_M = 1.80
+
+# Logical cell sizes used only to derive legacy col_x/col_y/level coordinates
+# from continuous positions for backwards compatibility with existing events.
+_LEGACY_CELL_X_M = 0.30
+_LEGACY_CELL_Y_M = 0.27
+_LEGACY_CELL_H_M = 0.30
+
+_BBOX_EPS = 1e-6
 
 
 class PalletKind(str, Enum):
@@ -50,6 +54,9 @@ class PalletClass(str, Enum):
 
 @dataclass(frozen=True)
 class PalletLayout:
+    """Legacy layout descriptor — kept for the validator and old visualizers
+    that still need approximate cell counts. The new bin-packer ignores it."""
+
     cols_x: int
     cols_y: int
     max_level: int
@@ -86,10 +93,16 @@ class PalletItem:
     unit_weight_kg: float
     intended_client: str | None
     is_returnable_empty: bool = False
-    # Discrete grid position within pallet:
-    col_x: int = 0
-    col_y: int = 0
-    bottom_level: int = 0
+    physical_type: str = "unit"
+
+    # Continuous 3D placement (metres from pallet corner).
+    # pos_* is the bottom-left-front corner of the AABB.
+    pos_x: float = 0.0
+    pos_y: float = 0.0
+    pos_z: float = 0.0
+    dim_x: float = 0.20
+    dim_y: float = 0.20
+    dim_h: float = 0.24
 
     @property
     def volume_m3(self) -> float:
@@ -99,15 +112,75 @@ class PalletItem:
     def weight_kg(self) -> float:
         return self.qty * self.unit_weight_kg
 
+    # AABB extents.
+    @property
+    def end_x(self) -> float:
+        return self.pos_x + self.dim_x
+
+    @property
+    def end_y(self) -> float:
+        return self.pos_y + self.dim_y
+
+    @property
+    def top_z(self) -> float:
+        return self.pos_z + self.dim_h
+
+    def aabb(self) -> tuple[float, float, float, float, float, float]:
+        return (self.pos_x, self.pos_y, self.pos_z, self.end_x, self.end_y, self.top_z)
+
+    def overlaps_xy(self, other: "PalletItem") -> bool:
+        return (
+            self.pos_x < other.end_x - _BBOX_EPS
+            and other.pos_x < self.end_x - _BBOX_EPS
+            and self.pos_y < other.end_y - _BBOX_EPS
+            and other.pos_y < self.end_y - _BBOX_EPS
+        )
+
+    def overlaps_xz(self, other: "PalletItem") -> bool:
+        return (
+            self.pos_x < other.end_x - _BBOX_EPS
+            and other.pos_x < self.end_x - _BBOX_EPS
+            and self.pos_z < other.top_z - _BBOX_EPS
+            and other.pos_z < self.top_z - _BBOX_EPS
+        )
+
+    # ---- Legacy discrete-grid properties (derived from continuous coords) ----
+
+    @property
+    def col_x(self) -> int:
+        return max(0, int(self.pos_x / _LEGACY_CELL_X_M))
+
+    @property
+    def col_y(self) -> int:
+        return max(0, int(self.pos_y / _LEGACY_CELL_Y_M))
+
+    @property
+    def bottom_level(self) -> int:
+        return max(0, int(self.pos_z / _LEGACY_CELL_H_M))
+
     @property
     def stack_size(self) -> int:
-        if self.qty <= 0:
+        if self.dim_h <= 0:
             return 0
-        return max(1, int(ceil(self.qty)))
+        return max(1, int(ceil(self.dim_h / _LEGACY_CELL_H_M)))
 
     @property
     def top_level(self) -> int:
         return self.bottom_level + max(0, self.stack_size - 1)
+
+
+def _aabb_overlaps(
+    a: tuple[float, float, float, float, float, float],
+    b: tuple[float, float, float, float, float, float],
+) -> bool:
+    return (
+        a[0] < b[3] - _BBOX_EPS
+        and b[0] < a[3] - _BBOX_EPS
+        and a[1] < b[4] - _BBOX_EPS
+        and b[1] < a[4] - _BBOX_EPS
+        and a[2] < b[5] - _BBOX_EPS
+        and b[2] < a[5] - _BBOX_EPS
+    )
 
 
 @dataclass(frozen=True)
@@ -156,27 +229,60 @@ class Pallet:
             pallet_class=cls,
         )
 
-    def column_top(self, col_x: int, col_y: int) -> int:
-        """Next free level in the (col_x, col_y) column. 0 if empty."""
-        max_top = -1
-        for it in self.items:
-            if it.col_x == col_x and it.col_y == col_y and it.qty > 0:
-                if it.top_level > max_top:
-                    max_top = it.top_level
-        return max_top + 1
+    # ---- 3D bin-packing ----
 
-    def suggest_position(self) -> tuple[int, int, int]:
-        """Pick column with lowest current top. Returns (col_x, col_y, bottom_level)."""
-        layout = self.layout
-        best = (0, 0, 0)
-        best_top = 10**9
-        for cx in range(layout.cols_x):
-            for cy in range(layout.cols_y):
-                top = self.column_top(cx, cy)
-                if top < best_top:
-                    best_top = top
-                    best = (cx, cy, top)
+    def suggest_position(
+        self, dim_x: float, dim_y: float, dim_h: float
+    ) -> tuple[float, float, float]:
+        """Find a fit for the new item. Greedy extreme-point bin-packer."""
+        candidates: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)]
+        for it in self.items:
+            if it.qty <= 0:
+                continue
+            candidates.append((it.end_x, it.pos_y, it.pos_z))
+            candidates.append((it.pos_x, it.end_y, it.pos_z))
+            candidates.append((it.pos_x, it.pos_y, it.top_z))
+
+        # Deduplicate close anchors.
+        seen: list[tuple[float, float, float]] = []
+        for c in candidates:
+            if not any(
+                abs(c[0] - s[0]) < 1e-4
+                and abs(c[1] - s[1]) < 1e-4
+                and abs(c[2] - s[2]) < 1e-4
+                for s in seen
+            ):
+                seen.append(c)
+        candidates = seen
+
+        best: tuple[float, float, float] | None = None
+        for (x, y, z) in candidates:
+            # Inside pallet footprint (height is allowed to overflow — validator
+            # catches PALLET_HEIGHT_EXCEEDS_TRUCK).
+            if x + dim_x > PALLET_LENGTH_M + _BBOX_EPS:
+                continue
+            if y + dim_y > PALLET_WIDTH_M + _BBOX_EPS:
+                continue
+            new_box = (x, y, z, x + dim_x, y + dim_y, z + dim_h)
+            collides = False
+            for it in self.items:
+                if it.qty <= 0:
+                    continue
+                if _aabb_overlaps(new_box, it.aabb()):
+                    collides = True
+                    break
+            if collides:
+                continue
+            if best is None or (z, y, x) < (best[2], best[1], best[0]):
+                best = (x, y, z)
+
+        if best is None:
+            # No legal fit — drop the item on top of the tallest stack at (0,0).
+            max_z = max((it.top_z for it in self.items if it.qty > 0), default=0.0)
+            best = (0.0, 0.0, max_z)
         return best
+
+    # ---- Mutation helpers ----
 
     def remove_item(
         self, sku: str, qty: float, client: str | None
@@ -196,16 +302,24 @@ class Pallet:
                 if take >= it.qty:
                     removed = it
                     continue
+                # Partial take — kept item shrinks proportionally in height
+                # so the AABB stays consistent.
+                kept_qty = it.qty - take
+                ratio = kept_qty / it.qty if it.qty > 0 else 0.0
                 kept = PalletItem(
                     sku=it.sku,
-                    qty=it.qty - take,
+                    qty=kept_qty,
                     unit_volume_m3=it.unit_volume_m3,
                     unit_weight_kg=it.unit_weight_kg,
                     intended_client=it.intended_client,
                     is_returnable_empty=it.is_returnable_empty,
-                    col_x=it.col_x,
-                    col_y=it.col_y,
-                    bottom_level=it.bottom_level,
+                    physical_type=it.physical_type,
+                    pos_x=it.pos_x,
+                    pos_y=it.pos_y,
+                    pos_z=it.pos_z,
+                    dim_x=it.dim_x,
+                    dim_y=it.dim_y,
+                    dim_h=it.dim_h * ratio,
                 )
                 removed = PalletItem(
                     sku=it.sku,
@@ -214,9 +328,13 @@ class Pallet:
                     unit_weight_kg=it.unit_weight_kg,
                     intended_client=it.intended_client,
                     is_returnable_empty=it.is_returnable_empty,
-                    col_x=it.col_x,
-                    col_y=it.col_y,
-                    bottom_level=it.bottom_level,
+                    physical_type=it.physical_type,
+                    pos_x=it.pos_x,
+                    pos_y=it.pos_y,
+                    pos_z=it.pos_z + kept.dim_h,
+                    dim_x=it.dim_x,
+                    dim_y=it.dim_y,
+                    dim_h=it.dim_h - kept.dim_h,
                 )
                 new_items.append(kept)
                 continue

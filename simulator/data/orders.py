@@ -17,7 +17,7 @@ from simulator.config import (
     TRUCK_SPECS,
     TruckSpec,
 )
-from simulator.data.catalog import Catalog
+from simulator.data.catalog import Catalog, PhysicalType
 from simulator.data.clients import Clients
 from simulator.data.loader import RawData
 
@@ -30,6 +30,13 @@ class OrderLine:
     unit_volume_m3: float
     unit_weight_kg: float
     is_returnable: bool
+    physical_type: PhysicalType = PhysicalType.UNIT
+    # Real per-unit physical dimensions (m). 0.0 means "no data" — caller
+    # should fall back to type defaults.
+    dim_x_m: float = 0.0
+    dim_y_m: float = 0.0
+    dim_h_m: float = 0.0
+    dim_source: str = "type"  # "data" | "type"
 
 
 @dataclass(frozen=True)
@@ -179,6 +186,11 @@ class DayCaseBuilder:
                     unit_volume_m3=rec.unit_volume_m3,
                     unit_weight_kg=rec.unit_weight_kg,
                     is_returnable=rec.is_returnable,
+                    physical_type=rec.physical_type,
+                    dim_x_m=rec.dim_x_m,
+                    dim_y_m=rec.dim_y_m,
+                    dim_h_m=rec.dim_h_m,
+                    dim_source=rec.dim_source,
                 )
             )
         return lines

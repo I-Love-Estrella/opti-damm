@@ -28,6 +28,7 @@ from simulator.domain.commands import (
     ReturnDepot,
     Unload,
 )
+from simulator.data.catalog import physical_dims
 from simulator.domain.pallet import (
     Pallet,
     PalletClass,
@@ -156,20 +157,40 @@ class Simulator:
             raise _CommandError(f"Pick onto unknown pallet {cmd.pallet_id}")
         order_line = _find_order_line(st.case, cmd.sku, cmd.intended_client)
         if order_line is None:
-            unit_v, unit_w, uma = 0.001, 1.0, "UN"
+            unit_v, unit_w, uma, ptype = 0.001, 1.0, "UN", "unit"
         else:
             unit_v, unit_w, uma = (
                 order_line.unit_volume_m3,
                 order_line.unit_weight_kg,
                 order_line.uma,
             )
+            ptype = order_line.physical_type.value if hasattr(order_line.physical_type, "value") else str(order_line.physical_type)
         item_class = sku_class_for_uma(uma)
         if pallet.pallet_class is None:
             pallet = pallet.with_class(item_class)
         elif pallet.pallet_class != item_class:
             st.capacity_violations += 1
-        col_x, col_y, bottom_level = pallet.suggest_position()
-        if bottom_level >= pallet.layout.max_level:
+        # Physical extents: prefer real ZM040 dimensions for this SKU, fall
+        # back to per-type estimates. Height scales with qty so a Pick(qty=24)
+        # of small cans takes a stack ~24 cans tall.
+        if (
+            order_line is not None
+            and order_line.dim_source == "data"
+            and order_line.dim_x_m > 0
+            and order_line.dim_y_m > 0
+            and order_line.dim_h_m > 0
+        ):
+            dim_x, dim_y, single_h = (
+                order_line.dim_x_m,
+                order_line.dim_y_m,
+                order_line.dim_h_m,
+            )
+        else:
+            dim_x, dim_y, single_h = physical_dims(ptype)
+        total_h = max(1.0, float(cmd.qty)) * single_h
+        pos_x, pos_y, pos_z = pallet.suggest_position(dim_x, dim_y, total_h)
+        if pos_z + total_h > 1.80 + 0.01:
+            # Soft signal — exact validation runs in the validator.
             st.capacity_violations += 1
         item = PalletItem(
             sku=cmd.sku,
@@ -178,9 +199,13 @@ class Simulator:
             unit_weight_kg=unit_w,
             intended_client=cmd.intended_client,
             is_returnable_empty=False,
-            col_x=col_x,
-            col_y=col_y,
-            bottom_level=bottom_level,
+            physical_type=ptype,
+            pos_x=pos_x,
+            pos_y=pos_y,
+            pos_z=pos_z,
+            dim_x=dim_x,
+            dim_y=dim_y,
+            dim_h=total_h,
         )
         new_pallet = pallet.add_item(item)
         if cmd.pallet_id in st.cargo.staging:
@@ -302,6 +327,12 @@ class Simulator:
                     col_x=b.col_x,
                     col_y=b.col_y,
                     bottom_level=b.bottom_level,
+                    pos_x=b.pos_x,
+                    pos_y=b.pos_y,
+                    pos_z=b.pos_z,
+                    dim_x=b.dim_x,
+                    dim_y=b.dim_y,
+                    dim_h=b.dim_h,
                     level=level,
                     unit_idx=unit,
                     total_units=b.stack_size,
@@ -340,6 +371,12 @@ class Simulator:
                 col_x=target.col_x,
                 col_y=target.col_y,
                 bottom_level=target.bottom_level,
+                pos_x=target.pos_x,
+                pos_y=target.pos_y,
+                pos_z=target.pos_z,
+                dim_x=target.dim_x,
+                dim_y=target.dim_y,
+                dim_h=target.dim_h,
                 level=level,
                 unit_idx=u,
                 total_units=target_units,
@@ -372,6 +409,12 @@ class Simulator:
                     col_x=b.col_x,
                     col_y=b.col_y,
                     bottom_level=b.bottom_level,
+                    pos_x=b.pos_x,
+                    pos_y=b.pos_y,
+                    pos_z=b.pos_z,
+                    dim_x=b.dim_x,
+                    dim_y=b.dim_y,
+                    dim_h=b.dim_h,
                     level=level,
                     unit_idx=unit,
                     total_units=b.stack_size,
@@ -412,8 +455,11 @@ class Simulator:
         if pallet.pallet_class is None:
             pallet = pallet.with_class(PalletClass.KEG)
             st.cargo.pallet_by_id[pallet.pallet_id] = pallet
-        col_x, col_y, bottom_level = pallet.suggest_position()
-        if bottom_level >= pallet.layout.max_level:
+        # Empty kegs use keg dimensions; cmd.qty stacks them vertically.
+        dim_x, dim_y, single_h = physical_dims("keg")
+        total_h = max(1.0, float(cmd.qty)) * single_h
+        pos_x, pos_y, pos_z = pallet.suggest_position(dim_x, dim_y, total_h)
+        if pos_z + total_h > 1.80 + 0.01:
             st.capacity_violations += 1
         item = PalletItem(
             sku=cmd.sku,
@@ -422,9 +468,13 @@ class Simulator:
             unit_weight_kg=2.0,
             intended_client=None,
             is_returnable_empty=True,
-            col_x=col_x,
-            col_y=col_y,
-            bottom_level=bottom_level,
+            physical_type="keg",
+            pos_x=pos_x,
+            pos_y=pos_y,
+            pos_z=pos_z,
+            dim_x=dim_x,
+            dim_y=dim_y,
+            dim_h=total_h,
         )
         st.cargo.pallet_by_id[pallet.pallet_id] = pallet.add_item(item)
         st.picked_returns[(cmd.client_id, cmd.sku)] = (
@@ -549,17 +599,16 @@ class Simulator:
 
         for _, target in targets:
             for it in pallet.items:
-                if id(it) in target_ids:
+                if id(it) in target_ids or it.qty <= 0:
                     continue
-                same_col = it.col_x == target.col_x and it.col_y == target.col_y
-                is_above = same_col and it.bottom_level > target.top_level
-                is_edge = it.col_y < target.col_y
+                is_above = it.pos_z + 1e-6 >= target.top_z and it.overlaps_xy(target)
+                is_edge = it.pos_y + 1e-6 < target.pos_y and it.overlaps_xz(target)
                 if not (is_above or is_edge):
                     continue
                 it_id = id(it)
                 reasons.setdefault(
                     it_id,
-                    "in target column above target" if is_above else "in stack closer to truck edge",
+                    "stacked above target" if is_above else "in front of target (closer to door)",
                 )
                 if it.intended_client == client_id:
                     if it_id not in same_seen:
@@ -573,7 +622,7 @@ class Simulator:
         # Lift order: closer to edge first, then top-down within column.
         lift_order = sorted(
             foreign_blockers + same_client_in_path,
-            key=lambda b: (b.col_y, b.col_x, -b.bottom_level),
+            key=lambda b: (b.pos_y, b.pos_x, -b.pos_z),
         )
 
         moves = sum(b.stack_size for b in lift_order)
@@ -599,16 +648,23 @@ class Simulator:
                     col_x=b.col_x,
                     col_y=b.col_y,
                     bottom_level=b.bottom_level,
+                    pos_x=b.pos_x,
+                    pos_y=b.pos_y,
+                    pos_z=b.pos_z,
+                    dim_x=b.dim_x,
+                    dim_y=b.dim_y,
+                    dim_h=b.dim_h,
                     level=level,
                     unit_idx=unit,
                     total_units=b.stack_size,
                     time_min=round(per_box_lift, 4),
                     reason=reasons.get(id(b), ""),
                     will_be_delivered=will_be_delivered,
+                    physical_type=b.physical_type,
                 )
 
         # Phase 2: take all targets (top-down, edge-first to keep physics tidy).
-        targets_sorted = sorted(targets, key=lambda ct: (ct[1].col_y, ct[1].col_x, -ct[1].bottom_level))
+        targets_sorted = sorted(targets, key=lambda ct: (ct[1].pos_y, ct[1].pos_x, -ct[1].pos_z))
         for cmd, target in targets_sorted:
             self._take_item(
                 slot_id=slot_id,
@@ -624,7 +680,7 @@ class Simulator:
 
         # Phase 3: deliver same-client items that were lifted as path-clearing.
         same_client_sorted = sorted(
-            same_client_in_path, key=lambda b: (b.col_y, b.col_x, -b.bottom_level)
+            same_client_in_path, key=lambda b: (b.pos_y, b.pos_x, -b.pos_z)
         )
         for it in same_client_sorted:
             self._take_item(
@@ -655,11 +711,18 @@ class Simulator:
                     col_x=b.col_x,
                     col_y=b.col_y,
                     bottom_level=b.bottom_level,
+                    pos_x=b.pos_x,
+                    pos_y=b.pos_y,
+                    pos_z=b.pos_z,
+                    dim_x=b.dim_x,
+                    dim_y=b.dim_y,
+                    dim_h=b.dim_h,
                     level=level,
                     unit_idx=unit,
                     total_units=b.stack_size,
                     time_min=round(per_box_replace, 4),
                     reason="restore stack after target taken",
+                    physical_type=b.physical_type,
                 )
 
     def _take_item(
@@ -727,12 +790,19 @@ class Simulator:
                 col_x=item_for_log.col_x,
                 col_y=item_for_log.col_y,
                 bottom_level=item_for_log.bottom_level,
+                pos_x=item_for_log.pos_x,
+                pos_y=item_for_log.pos_y,
+                pos_z=item_for_log.pos_z,
+                dim_x=item_for_log.dim_x,
+                dim_y=item_for_log.dim_y,
+                dim_h=item_for_log.dim_h,
                 level=level,
                 unit_idx=u,
                 total_units=target_units,
                 time_min=round(per_unit_take, 4),
                 reason=reason,
                 opportunistic=opportunistic,
+                physical_type=item_for_log.physical_type,
             )
 
         if new_pallet.is_empty:
@@ -754,55 +824,48 @@ class Simulator:
         )
 
     def _blockers_in_lift_order(self, pallet: Pallet, target: PalletItem) -> list[PalletItem]:
-        """Items that must be lifted off to reach `target`, sorted in the order
-        a driver would actually move them: closer-to-edge stacks first, then
-        top-down within each column.
+        """Items that must be lifted off to reach `target`. Two reasons to
+        block: (1) item sits physically above target (z above target.top_z and
+        xy footprint overlaps), (2) item is closer to the truck edge (lower y)
+        and overlaps target's xz extent — driver has to pull it out of the way.
+
+        Lift order: edge-first (lowest pos_y), then top-down (highest pos_z).
         """
         out: list[PalletItem] = []
         for it in pallet.items:
-            if it is target:
+            if it is target or it.qty <= 0:
                 continue
-            same_col = it.col_x == target.col_x and it.col_y == target.col_y
-            if same_col and it.bottom_level > target.top_level:
+            above = it.pos_z + 1e-6 >= target.top_z and it.overlaps_xy(target)
+            front = it.pos_y + 1e-6 < target.pos_y and it.overlaps_xz(target)
+            if above or front:
                 out.append(it)
-                continue
-            if it.col_y < target.col_y:
-                out.append(it)
-        out.sort(key=lambda b: (b.col_y, b.col_x, -b.bottom_level))
+        out.sort(key=lambda b: (b.pos_y, b.pos_x, -b.pos_z))
         return out
 
     def _search_moves(self, pallet: Pallet, client: str, sku: str) -> int:
-        """Physical-access cost in number of physical units to lift off.
+        """Physical-access cost: number of stacked-unit equivalents that must
+        be lifted off to reach the target item, computed via bbox overlap.
 
-        Convention: col_y is depth from the truck edge. col_y=0 is the door
-        side; larger col_y is deeper inside. To reach a target at column
-        (col_x, col_y, level), the driver must remove:
-
-          1. every unit in the same column above the target
-             (same col_x, same col_y, bottom_level > target.top_level)
-          2. every unit in any column closer to the edge
-             (any col_x, any level, col_y' < target.col_y)
-
-        Both buckets are summed as physical units (stack_size each).
+        An item blocks the target when:
+          - it sits above target (pos_z >= target.top_z) and xy footprints overlap
+          - or it is closer to the truck edge (lower pos_y) and overlaps the
+            target in (x, z)
         """
-        target_idx = -1
-        for i, it in enumerate(pallet.items):
+        target = None
+        for it in pallet.items:
             if it.sku == sku and it.intended_client in (None, client):
-                target_idx = i
+                target = it
                 break
-        if target_idx < 0:
+        if target is None:
             return 0
 
-        target = pallet.items[target_idx]
         moves = 0
-        for j, it in enumerate(pallet.items):
-            if j == target_idx:
+        for it in pallet.items:
+            if it is target or it.qty <= 0:
                 continue
-            same_column = it.col_x == target.col_x and it.col_y == target.col_y
-            if same_column and it.bottom_level > target.top_level:
-                moves += it.stack_size
-                continue
-            if it.col_y < target.col_y:
+            above = it.pos_z + 1e-6 >= target.top_z and it.overlaps_xy(target)
+            front = it.pos_y + 1e-6 < target.pos_y and it.overlaps_xz(target)
+            if above or front:
                 moves += it.stack_size
         return moves
 

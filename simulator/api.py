@@ -23,12 +23,18 @@ from urllib.parse import parse_qs, urlparse
 from simulator.algorithms import REGISTRY, get
 from simulator.bench.runner import BenchConfig, run as bench_run
 from simulator.core.simulator import Simulator
-from simulator.data.catalog import Catalog
+from simulator.data.catalog import (
+    Catalog,
+    PHYSICAL_TYPE_CODE,
+    PHYSICAL_TYPE_LABEL,
+    PhysicalType,
+)
 from simulator.data.clients import Clients
 from simulator.data.loader import load_all
 from simulator.data.network import Network
 from simulator.data.orders import DayCaseBuilder
 from simulator.kpis.metrics import compute
+from simulator.validation import validate_plan
 
 
 _LOCK = threading.Lock()
@@ -56,6 +62,17 @@ def _ctx() -> dict[str, object]:
                 }
             )
     return _CACHE
+
+
+def _list_physical_types() -> list[dict]:
+    return [
+        {
+            "value": t.value,
+            "label": PHYSICAL_TYPE_LABEL[t],
+            "code": PHYSICAL_TYPE_CODE[t],
+        }
+        for t in PhysicalType
+    ]
 
 
 def _list_algorithms() -> list[dict]:
@@ -108,6 +125,7 @@ def _run_one(date: str, ruta: str, algo: str) -> dict:
     plan = get(algo).plan(case, clients, network)
     result = sim.run(case, plan)
     kpi = compute(result)
+    validation = validate_plan(case, plan, result, sim)
 
     pallet_count = len(
         {c.pallet_id for c in plan.commands if hasattr(c, "pallet_id") and getattr(c, "pallet_id", None)}
@@ -164,6 +182,13 @@ def _run_one(date: str, ruta: str, algo: str) -> dict:
                     "col_y": int(it.col_y),
                     "bottom_level": int(it.bottom_level),
                     "stack_size": int(it.stack_size),
+                    "physical_type": getattr(it, "physical_type", "unit"),
+                    "pos_x": float(it.pos_x),
+                    "pos_y": float(it.pos_y),
+                    "pos_z": float(it.pos_z),
+                    "dim_x": float(it.dim_x),
+                    "dim_y": float(it.dim_y),
+                    "dim_h": float(it.dim_h),
                 }
             )
         initial_cargo.append(
@@ -215,6 +240,7 @@ def _run_one(date: str, ruta: str, algo: str) -> dict:
         "pallets_planned": pallet_count,
         "initial_cargo": initial_cargo,
         "kpis": kpi.to_dict(),
+        "validation": validation.to_dict(),
     }
 
 
@@ -293,6 +319,17 @@ _PER_STOP_KINDS = {
 }
 
 
+def _type_tag(rec: dict) -> str:
+    pt = rec.get("physical_type")
+    if not pt:
+        return ""
+    try:
+        ptype = PhysicalType(pt)
+    except ValueError:
+        return ""
+    return f"[{PHYSICAL_TYPE_CODE.get(ptype, '?')}]"
+
+
 def _stage_description(rec: dict) -> str:
     kind = rec["kind"]
     if kind == "ARRIVE":
@@ -307,7 +344,9 @@ def _stage_description(rec: dict) -> str:
         unit = rec.get("unit_idx")
         total = rec.get("total_units")
         unit_tag = f" [{int(unit) + 1}/{int(total)}]" if unit is not None and total else ""
-        return f"Lift 1 box {sku}{unit_tag} from {col} lvl {level} (for client {whose}) — {rec.get('reason')}"
+        type_tag = _type_tag(rec)
+        type_prefix = f"{type_tag} " if type_tag else ""
+        return f"Lift 1 {type_prefix}box {sku}{unit_tag} from {col} lvl {level} (for client {whose}) — {rec.get('reason')}"
     if kind == "TARGET_TAKE":
         sku = rec.get("sku")
         col = f"col ({rec.get('col_x')},{rec.get('col_y')})"
@@ -315,7 +354,9 @@ def _stage_description(rec: dict) -> str:
         unit = rec.get("unit_idx")
         total = rec.get("total_units")
         unit_tag = f" [{int(unit) + 1}/{int(total)}]" if unit is not None and total else ""
-        return f"Take 1 box {sku}{unit_tag} from {col} lvl {level} → hand to client"
+        type_tag = _type_tag(rec)
+        type_prefix = f"{type_tag} " if type_tag else ""
+        return f"Take 1 {type_prefix}box {sku}{unit_tag} from {col} lvl {level} → hand to client"
     if kind == "BLOCKER_REPLACE":
         sku = rec.get("sku")
         col = f"col ({rec.get('col_x')},{rec.get('col_y')})"
@@ -323,7 +364,9 @@ def _stage_description(rec: dict) -> str:
         unit = rec.get("unit_idx")
         total = rec.get("total_units")
         unit_tag = f" [{int(unit) + 1}/{int(total)}]" if unit is not None and total else ""
-        return f"Put 1 box {sku}{unit_tag} back into {col} lvl {level}"
+        type_tag = _type_tag(rec)
+        type_prefix = f"{type_tag} " if type_tag else ""
+        return f"Put 1 {type_prefix}box {sku}{unit_tag} back into {col} lvl {level}"
     if kind == "UNLOAD":
         return f"Delivery line complete — {rec.get('sku')} ×{rec.get('qty', 0):g} ({rec.get('search_moves', 0)} search-moves)"
     if kind == "DROP":
@@ -455,6 +498,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/api/algorithms":
                 self._json(200, {"algorithms": _list_algorithms()})
+                return
+            if url.path == "/api/types":
+                self._json(200, {"types": _list_physical_types()})
                 return
             if url.path == "/api/days":
                 qs = parse_qs(url.query)

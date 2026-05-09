@@ -103,6 +103,10 @@ export function buildInitialBoxes(initialCargo = []) {
     const items = slotEntry.pallet.items || [];
     for (const it of items) {
       const stackSize = Math.max(1, it.stack_size || 1);
+      // Per-physical-box: split a stack of N units into N cubes stacked
+      // vertically by (it.dim_h / N). Continuous pos lets us render exactly
+      // where the bin-packer placed each item.
+      const slice_h = stackSize > 0 ? (it.dim_h ?? 0) / stackSize : 0;
       for (let i = 0; i < stackSize; i++) {
         boxes.push({
           id: `b${id++}`,
@@ -110,14 +114,22 @@ export function buildInitialBoxes(initialCargo = []) {
           side: slotEntry.side,
           pallet_class: slotEntry.pallet.pallet_class,
           layout: slotEntry.pallet.layout,
+          // Legacy discrete coords (kept for stage-event matching).
           col_x: it.col_x,
           col_y: it.col_y,
           level: it.bottom_level + i,
+          // Continuous coords for rendering — i-th physical unit in stack.
+          pos_x: it.pos_x ?? 0,
+          pos_y: it.pos_y ?? 0,
+          pos_z: (it.pos_z ?? 0) + i * slice_h,
+          dim_x: it.dim_x ?? 0.20,
+          dim_y: it.dim_y ?? 0.20,
+          dim_h: slice_h || (it.dim_h ?? 0.24),
           sku: it.sku,
-          // qty per physical box ≈ qty / stackSize (informational only)
           qty: stackSize > 0 ? it.qty / stackSize : it.qty,
           intended_client: it.intended_client,
           is_returnable_empty: it.is_returnable_empty,
+          physical_type: it.physical_type || 'unit',
           stack_member_idx: i,
           stack_member_total: stackSize,
           source_sku: it.sku,
@@ -224,6 +236,7 @@ export function cargoStateAt(initialCargo, stages, idx) {
             qty: 1,
             intended_client: null,
             is_returnable_empty: true,
+            physical_type: 'keg',
             stack_member_idx: k,
             stack_member_total: qty,
             source_sku: d.sku || 'EMPTY',

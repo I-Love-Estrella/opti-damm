@@ -14,6 +14,7 @@ import TruckPanel from '@/components/TruckPanel';
 import CopilotPanel from '@/components/CopilotPanel';
 import MetricsBar from '@/components/MetricsBar';
 import WarehousePanel from '@/components/WarehousePanel';
+import { api, SIM_API_BASE } from '@/lib/api';
 
 const MapPanel = dynamic(() => import('@/components/MapPanel'), { ssr: false });
 
@@ -122,6 +123,11 @@ export default function Page() {
   const [collapsed, setCollapsed] = useState(new Set());
   const [fullscreenPanel, setFullscreenPanel] = useState(null);
   const [panelMenuOpen, setPanelMenuOpen] = useState(false);
+  const [pdfMenuOpen, setPdfMenuOpen] = useState(false);
+  const [availableRoutes, setAvailableRoutes] = useState([]);
+  const [selectedRoute, setSelectedRoute] = useState(null);
+  const [routeDetail, setRouteDetail] = useState(null);
+  const pdfMenuRef = useRef(null);
   const [colWidths, setColWidths] = useState({ map: 1.25, truck: 1, right: 1 });
   const [rightSplit, setRightSplit] = useState(0.5);
   const panelMenuRef = useRef(null);
@@ -159,6 +165,37 @@ export default function Page() {
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
+  }, []);
+
+  useEffect(() => {
+    api.routes().then(routes => {
+      setAvailableRoutes(routes);
+      if (routes.length > 0 && !selectedRoute) {
+        setSelectedRoute(routes[0]);
+      }
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!selectedRoute) return;
+    api.routeDetail(selectedRoute.fecha, selectedRoute.ruta)
+      .then(setRouteDetail)
+      .catch(() => setRouteDetail(null));
+  }, [selectedRoute]);
+
+  useEffect(() => {
+    if (!pdfMenuOpen) return;
+    const handler = (e) => {
+      if (pdfMenuRef.current && !pdfMenuRef.current.contains(e.target)) {
+        setPdfMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [pdfMenuOpen]);
+
+  const openPdf = useCallback((path) => {
+    window.open(`${SIM_API_BASE}${path}`, '_blank');
   }, []);
 
   useEffect(() => {
@@ -405,6 +442,69 @@ export default function Page() {
           </div>
         </div>
         <div className="header-right">
+          <div className="panel-menu-wrap" ref={pdfMenuRef}>
+            <button className="panel-menu-btn" onClick={() => setPdfMenuOpen(prev => !prev)}>
+              <span className="pm-icon">⎙</span>
+              Documents
+            </button>
+            {pdfMenuOpen && (
+              <div className="panel-menu" style={{ width: 320 }}>
+                <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--navy-20, #ccc)' }}>
+                  <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', opacity: 0.6 }}>Route</label>
+                  <select
+                    value={selectedRoute ? `${selectedRoute.fecha}|${selectedRoute.ruta}` : ''}
+                    onChange={(e) => {
+                      const [fecha, ruta] = e.target.value.split('|');
+                      const r = availableRoutes.find(r => r.fecha === fecha && r.ruta === ruta);
+                      if (r) setSelectedRoute(r);
+                    }}
+                    style={{
+                      display: 'block', width: '100%', marginTop: 4, padding: '4px 6px',
+                      fontFamily: 'var(--mono)', fontSize: 12, background: 'var(--cream, #faf9f6)',
+                      border: '1px solid #ccc', borderRadius: 4
+                    }}
+                  >
+                    {availableRoutes.map(r => (
+                      <option key={`${r.fecha}|${r.ruta}`} value={`${r.fecha}|${r.ruta}`}>
+                        {r.fecha} · {r.ruta} · {r.clients} clients
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {selectedRoute && (
+                  <>
+                    <button
+                      className="pm-item"
+                      onClick={() => { openPdf(`/pdf/hoja-carga/${selectedRoute.fecha}/${selectedRoute.ruta}`); setPdfMenuOpen(false); }}
+                    >
+                      <span className="pm-idx">HC</span>
+                      <span className="pm-label">Hoja de Carga</span>
+                    </button>
+                    <button
+                      className="pm-item"
+                      onClick={() => { openPdf(`/pdf/hoja-ruta/${selectedRoute.fecha}/${selectedRoute.ruta}`); setPdfMenuOpen(false); }}
+                    >
+                      <span className="pm-idx">HR</span>
+                      <span className="pm-label">Hoja de Ruta</span>
+                    </button>
+                    <div style={{ padding: '4px 10px 2px', borderTop: '1px solid var(--navy-20, #ccc)' }}>
+                      <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', opacity: 0.6 }}>Albaranes</label>
+                    </div>
+                    {routeDetail && routeDetail.orders.map(order => (
+                      <button
+                        key={order.client_id}
+                        className="pm-item"
+                        onClick={() => { openPdf(`/pdf/albaran/${selectedRoute.fecha}/${selectedRoute.ruta}/${order.client_id}`); setPdfMenuOpen(false); }}
+                      >
+                        <span className="pm-idx">AB</span>
+                        <span className="pm-label">{order.client_name || order.client_id}</span>
+                      </button>
+                    ))}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
           <div className="panel-menu-wrap" ref={panelMenuRef}>
             <button className="panel-menu-btn" onClick={() => setPanelMenuOpen(prev => !prev)}>
               <span className="pm-icon">▦</span>

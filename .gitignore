@@ -1,12 +1,45 @@
-# Python
+# Python bytecode
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Distribution / packaging
 *.egg-info/
+*.egg
 dist/
 build/
+sdist/
+wheels/
+*.whl
+
+# Virtual environments
 .venv/
 venv/
+ENV/
+env/
+
+# Environment variables
 .env
+.env.*
+
+# Python tools
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+*.pyi
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
 
 # Node / Next.js
 node_modules/
@@ -15,6 +48,9 @@ out/
 
 # Data caches (regenerated from Excel)
 data_cache/
+
+# SQLite
+*.db
 
 # IDE
 .idea/
@@ -29,6 +65,5 @@ Thumbs.db
 
 # Testing / tooling
 .playwright-mcp/
-.pytest_cache/
-htmlcov/
-.coverage
+
+docs/superpowers/*

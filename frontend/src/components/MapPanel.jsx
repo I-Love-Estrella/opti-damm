@@ -25,7 +25,7 @@ function formatDuration(secs) {
   return `${h}h${m.toString().padStart(2, "0")}`;
 }
 
-export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, hoveredPalletStops }) {
+export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, hoveredPalletStops, isFullscreen, isCollapsed }) {
   const wrapRef = useRef(null);
   const mapRef = useRef(null);
   const layersRef = useRef({ markers: [], routes: [], depot: null });
@@ -35,12 +35,20 @@ export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, h
   const visibleStops = useMemo(() => stops.filter(s => !s.cancelled), [stops]);
 
   useEffect(() => {
+    if (!isCollapsed && mapRef.current) {
+      const t1 = setTimeout(() => mapRef.current.invalidateSize(), 50);
+      const t2 = setTimeout(() => mapRef.current.invalidateSize(), 350);
+      return () => { clearTimeout(t1); clearTimeout(t2); };
+    }
+  }, [isCollapsed, isFullscreen]);
+
+  useEffect(() => {
     if (!wrapRef.current || mapRef.current) return;
 
     const map = L.map(wrapRef.current, {
       zoomControl: false,
       attributionControl: false,
-      scrollWheelZoom: false,
+      scrollWheelZoom: true,
       doubleClickZoom: false,
       dragging: true,
       zoomSnap: 0.25,

@@ -1,18 +1,26 @@
-// Thin client for the simulator HTTP API.
-// Configure base URL via NEXT_PUBLIC_SIM_API (defaults to localhost:8000).
+// Thin client for the backend HTTP API.
+// Configure base URL via NEXT_PUBLIC_API_URL or NEXT_PUBLIC_SIM_API.
 
-const BASE = process.env.NEXT_PUBLIC_SIM_API || 'http://127.0.0.1:8000';
+const BASE =
+  process.env.NEXT_PUBLIC_API_URL ||
+  process.env.NEXT_PUBLIC_SIM_API ||
+  'http://127.0.0.1:8000';
 
 async function jsonRequest(path, init = {}) {
+  const headers = { ...(init.headers || {}) };
+  if (init.body && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...init,
+    headers,
   });
   if (!res.ok) {
     let detail = '';
     try {
       const body = await res.json();
-      detail = body?.error || '';
+      detail = body?.error || body?.detail || '';
     } catch {
       /* ignore */
     }
@@ -35,6 +43,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ algos, max_cases: maxCases, seed, min_clients: minClients }),
     }),
+  routes: () => jsonRequest('/routes'),
+  routeDetail: (date, ruta) => jsonRequest(`/routes/${date}/${ruta}`),
 };
 
 export const SIM_API_BASE = BASE;

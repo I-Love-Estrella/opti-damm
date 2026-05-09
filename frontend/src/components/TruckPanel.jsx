@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { SKU_TONE, STOP_TONE, CLIENT_ORDERS } from '@/data';
+import { SKU_TONE, STOP_TONE, CLIENT_ORDERS, TRUCK_TYPES } from '@/data';
 
 const TRUCK_MODES = [
   { key: "reference", label: "By Reference" },
@@ -24,11 +24,13 @@ function shortClient(c) {
   return c.length > 12 ? c.slice(0, 11) + "…" : c;
 }
 
-export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, onPalletHover, hoveredPallet, onPalletClick, selectedClient, returnableCount }) {
+export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, onPalletHover, hoveredPallet, onPalletClick, selectedClient, truckType, onTruckTypeChange }) {
+  const spec = TRUCK_TYPES[truckType] || TRUCK_TYPES.T6;
   const totalCells = pallets.length;
   const filled = pallets.filter(p => p.sku).length;
   const utilization = Math.round((filled / totalCells) * 100);
   const totalWt = pallets.reduce((acc, p) => acc + (p.wt || 0), 0);
+  const rows = Math.ceil(spec.capacity / spec.cols);
 
   function tone(p) {
     if (!p.sku) return null;
@@ -63,12 +65,25 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
         <div className="panel-title">
           <span className="panel-index">02</span>
           Load
-          <span className="panel-code">TRK-04 · 8 PLT</span>
+          <span className="panel-code">{spec.code} · {spec.capacity} PLT</span>
         </div>
         <div className="panel-readout">
           <span className="ro-row"><strong>{utilization}%</strong> · {filled}/{totalCells} PLT</span>
-          <span className="ro-row ro-dim">{totalWt} KG · AXLE BAL OK</span>
+          <span className="ro-row ro-dim">{totalWt} KG / {spec.maxKg} KG</span>
         </div>
+      </div>
+
+      <div className="truck-type-toggle">
+        {Object.values(TRUCK_TYPES).map(t => (
+          <button
+            key={t.code}
+            className={`truck-type-btn ${truckType === t.code ? 'active' : ''}`}
+            onClick={() => onTruckTypeChange(t.code)}
+          >
+            {t.code}
+            <span className="tt-sub">{t.capacity}P · ×{t.fleet}</span>
+          </button>
+        ))}
       </div>
 
       <div className="mode-toggle">
@@ -85,19 +100,19 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
       <div className="mode-help">{MODE_HELP[mode]}</div>
 
       <div className="truck-caption">
-        <span>Top-down view · 2 × 4 grid · 8 pallet slots</span>
+        <span>Top-down view · {spec.cols} × {rows} grid · {spec.capacity} pallet slots</span>
         <span className="t-sub">colour = {mode === "reference" ? "SKU" : "destination stop"}</span>
       </div>
 
       <div className="truck-wrap">
         <span className="truck-label tl-cab">↑ CAB · FRONT</span>
         <span className="truck-label tl-rear">REAR DOORS ↓</span>
-        <div className="pallet-grid">
+        <div className="pallet-grid" style={{ gridTemplateColumns: `repeat(${spec.cols}, 1fr)` }}>
           {pallets.map(p => {
             const isHL = hoveredStop && p.stop === hoveredStop.id;
             return (
               <div
-                key={`${mode}-${p.idx}`}
+                key={`${truckType}-${mode}-${p.idx}`}
                 className={`pallet ${!p.sku ? 'empty' : ''} ${isHL ? 'highlight' : ''}`}
                 data-tone={tone(p)}
                 onMouseEnter={() => p.sku && onPalletHover && onPalletHover(p)}
@@ -151,7 +166,7 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
                        (hoveredStop && p.stop === hoveredStop.id);
           if (!p.sku) {
             return (
-              <div key={`mf-${mode}-${p.idx}`} className="manifest-row empty">
+              <div key={`mf-${truckType}-${mode}-${p.idx}`} className="manifest-row empty">
                 <span className="m-code">{p.code}</span>
                 <span className="m-client">— empty —</span>
                 <span className="m-stop">—</span>
@@ -162,7 +177,7 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
           }
           return (
             <div
-              key={`mf-${mode}-${p.idx}`}
+              key={`mf-${truckType}-${mode}-${p.idx}`}
               className={`manifest-row ${isHL ? 'highlight' : ''}`}
               onMouseEnter={() => onPalletHover && onPalletHover(p)}
               onMouseLeave={() => onPalletHover && onPalletHover(null)}

@@ -204,7 +204,7 @@ export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, h
           <span className="panel-code">RTE-2026.05.09.A</span>
         </div>
         <div className="panel-readout">
-          <span className="ro-row"><strong>{completedCount}</strong>/{visibleStops.length} STOPS · MOLLET → BCN</span>
+          <span className="ro-row"><strong>{completedCount}</strong>/{visibleStops.length} STOPS · MOLLET → VALLÈS</span>
           <span className="ro-row ro-dim">
             {routeMeta.status === "fetching" && "ROUTING via OSRM…"}
             {routeMeta.status === "ok" && `${routeMeta.km} KM · ${routeMeta.eta} DRIVE · OSRM`}
@@ -217,7 +217,7 @@ export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, h
         <div className="leaflet-host" ref={wrapRef}></div>
 
         <div className="map-overlay map-overlay-tl">
-          <div className="ov-chip">BCN · 41.39°N · 2.17°E</div>
+          <div className="ov-chip">MOLLET · 41.54°N · 2.21°E</div>
           <div className="ov-chip ov-chip-dim">EPSG:3857 · WEBMERC</div>
         </div>
         <div className="map-overlay map-overlay-tr">

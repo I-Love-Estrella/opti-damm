@@ -5,41 +5,43 @@ import dynamic from 'next/dynamic';
 import {
   STOPS,
   WAREHOUSE,
-  NEIGHBORHOODS,
-  PALLETS_BY_REFERENCE,
-  PALLETS_BY_CLIENT,
-  PALLETS_HYBRID,
+  ZONES,
+  PALLETS_T6,
+  PALLETS_T8,
+  TRUCK_TYPES,
 } from '@/data';
 import TruckPanel from '@/components/TruckPanel';
 import CopilotPanel from '@/components/CopilotPanel';
 import MetricsBar from '@/components/MetricsBar';
+import WarehousePanel from '@/components/WarehousePanel';
 
 const MapPanel = dynamic(() => import('@/components/MapPanel'), { ssr: false });
 
 const PROMPT_DEFS = [
   { id: "why",      label: "Why this route order?",        kind: "explain-route" },
   { id: "compare",  label: "Compare loading modes",        kind: "compare-load" },
-  { id: "traffic",  label: "Traffic on Diagonal 14:00",    kind: "traffic", alert: true },
-  { id: "cancel",   label: "Cancel Cal Pep order",         kind: "cancel",  alert: true },
+  { id: "traffic",  label: "Traffic on C-17 14:00",        kind: "traffic", alert: true },
+  { id: "cancel",   label: "Cancel Cafeteria Pradals",     kind: "cancel",  alert: true },
   { id: "reset",    label: "↻ Reset scenario",             kind: "reset",   disabled: true },
 ];
 
 const INITIAL_MESSAGES = [
-  { kind: "claude", text: 'Good morning, Manel. <b>Truck 04</b> is loaded — 7 of 8 pallets. Driver J. Martínez left Mollet at 08:14. Three stops complete, four to go. The route is optimised for <b>distance first</b>, with a soft preference for grouping returnables.' },
+  { kind: "claude", text: 'Good morning, Manel. <b>Truck 04</b> is loaded — route DR0054 heading north from Mollet. Driver J. Martínez left the depot at 08:14. Three stops complete, four to go. The route is optimised for <b>distance first</b>, with a soft preference for grouping returnables.' },
   { kind: "claude", text: 'Current ETA back at depot: <b>15:42</b>. Score: 87/100. Ask me anything — or pull a slider and I\'ll re-plan live.' },
 ];
 
 const INITIAL_LOG = [
-  { t: "08:14:02", tag: "DEPART", level: "ok",   msg: "TRK-04 · MOLLET DEPOT" },
-  { t: "08:42:18", tag: "STOP",   level: "ok",   msg: "S-01 BAR LA PLATA · 1 PLT DELIVERED" },
-  { t: "09:38:44", tag: "STOP",   level: "ok",   msg: "S-02 BODEGA JOAN · 2 PLT DELIVERED" },
-  { t: "10:24:09", tag: "STOP",   level: "ok",   msg: "S-03 CERVECERÍA CATALANA · 1 PLT DELIVERED" },
-  { t: "10:48:01", tag: "PING",   level: "info", msg: "GPS LOCK · 41.382°N 2.183°E · 23 KM/H" },
+  { t: "08:14:02", tag: "DEPART", level: "ok",   msg: "TRK-04 · DDI MOLLET DEPOT" },
+  { t: "08:42:18", tag: "STOP",   level: "ok",   msg: "S-01 LOS TERESITOS · 1 PLT DELIVERED" },
+  { t: "09:38:44", tag: "STOP",   level: "ok",   msg: "S-02 VIENA GRANOLLERS · 2 PLT DELIVERED" },
+  { t: "10:24:09", tag: "STOP",   level: "ok",   msg: "S-03 FRANKFURT LEO BOECK · 1 PLT DELIVERED" },
+  { t: "10:48:01", tag: "PING",   level: "info", msg: "GPS LOCK · 41.886°N 2.254°E · 23 KM/H" },
 ];
 
 export default function Page() {
   const [stops, setStops] = useState(STOPS);
   const [mode, setMode] = useState("reference");
+  const [truckType, setTruckType] = useState("T8");
   const [hoveredStop, setHoveredStop] = useState(null);
   const [hoveredPallet, setHoveredPallet] = useState(null);
   const [selectedClient, setSelectedClient] = useState(null);
@@ -56,14 +58,13 @@ export default function Page() {
     setSysLog(prev => [...prev, { t, ...entry }]);
   }, []);
 
+  const palletSource = truckType === "T6" ? PALLETS_T6 : PALLETS_T8;
+
   const pallets = useMemo(() => {
-    let base;
-    if (mode === "client") base = PALLETS_BY_CLIENT;
-    else if (mode === "hybrid") base = PALLETS_HYBRID;
-    else base = PALLETS_BY_REFERENCE;
+    const base = palletSource[mode] || palletSource.reference;
     const cancelled = stops.filter(s => s.cancelled).map(s => s.id);
     return base.map(p => cancelled.includes(p.stop) ? { ...p, sku: null, stop: null, ret: false, client: null, wt: 0 } : p);
-  }, [mode, stops]);
+  }, [mode, stops, palletSource]);
 
   const filledPallets = pallets.filter(p => p.sku);
   const returnableCount = filledPallets.length
@@ -108,7 +109,7 @@ export default function Page() {
   function handlePrompt(p) {
     if (p.kind === "explain-route") {
       pushMsg({ kind: "user", text: "Why this route order?" });
-      pushMsg({ kind: "claude", text: 'Three constraints stacked: <b>tight windows first</b> (Bar La Plata 08:30, Bodega Joan 09:00), then <b>geographic clustering</b> through Eixample, and finally <b>El Xampanyet</b> last because it\'s flagged high-priority and the driver wants the empties pickup on the return leg. Reversing 5 and 6 saves 0.4 km but breaks Quimet\'s window.' }, 700);
+      pushMsg({ kind: "claude", text: 'Three constraints stacked: <b>tight windows first</b> (Los Teresitos 08:30, Viena Granollers 09:00), then <b>geographic clustering</b> through Granollers and Vic, and finally <b>Hospital de Manlleu</b> last because it\'s flagged high-priority and the driver wants the empties pickup on the return leg via C-17. Reversing 5 and 6 saves 0.4 km but breaks Area Truck Shell\'s window.' }, 700);
       pushLog({ tag: "QUERY", level: "info", msg: "EXPLAIN-ROUTE · RTE-A" });
     }
     if (p.kind === "compare-load") {
@@ -118,16 +119,16 @@ export default function Page() {
     }
     if (p.kind === "traffic") {
       setScenario("traffic");
-      pushMsg({ kind: "alert", text: "Traffic incident — Diagonal closed 14:00–14:40. Three upcoming stops affected." });
+      pushMsg({ kind: "alert", text: "Traffic incident — C-17 closed at Centelles 14:00–14:40. Three upcoming stops affected." });
       pushMsg({ kind: "user", text: "Re-plan around it." });
-      pushMsg({ kind: "claude", text: 'Already done. Routing through <b>Aragó</b> instead of Diagonal between Sant Antoni and Born. Adds 1.8 km but stays within all delivery windows. <b>El Xampanyet</b> moves from 14:00 to 14:18 — still on time. Score drops 87 → 82.' }, 800);
+      pushMsg({ kind: "claude", text: 'Already done. Routing through <b>BV-5301</b> instead of C-17 between Vic and Manlleu. Adds 1.8 km but stays within all delivery windows. <b>Hospital de Manlleu</b> moves from 14:00 to 14:18 — still on time. Score drops 87 → 82.' }, 800);
       setWeights(w => ({ ...w, route: Math.max(30, w.route - 8), unload: Math.min(40, w.unload + 5) }));
-      pushLog({ tag: "ALERT", level: "info", msg: "TRAFFIC · DIAGONAL CLOSED 14:00-14:40" });
-      pushLog({ tag: "REPLAN", level: "ok", msg: "RTE-A → RTE-A2 · ARAGÓ DETOUR" });
+      pushLog({ tag: "ALERT", level: "info", msg: "TRAFFIC · C-17 CLOSED 14:00-14:40" });
+      pushLog({ tag: "REPLAN", level: "ok", msg: "RTE-A → RTE-A2 · BV-5301 DETOUR" });
     }
     if (p.kind === "cancel") {
       setScenario("cancel");
-      pushMsg({ kind: "alert", text: "Cal Pep cancelled the order. 1 pallet, EST 33CL × 24." });
+      pushMsg({ kind: "alert", text: "Cafeteria Pradals cancelled the order. 1 pallet, EST 33CL × 24." });
       pushMsg({ kind: "user", text: "Drop the stop and re-optimise." });
       setTimeout(() => {
         setStops(prev => prev.map(s => s.id === 4 ? { ...s, cancelled: true } : s));
@@ -135,7 +136,7 @@ export default function Page() {
       }, 250);
       pushMsg({ kind: "claude", text: 'Stop dropped. Route shortened from 7 to 6 stops, distance falls <b>11.4 km</b>, ETA back to depot now <b>14:58</b>. EST pallet stays loaded — re-route to tomorrow\'s 08:30 delivery. <b>Score climbs to 91</b>.' }, 900);
       setWeights(w => ({ ...w, load: Math.min(40, w.load + 6) }));
-      pushLog({ tag: "CANCEL", level: "info", msg: "S-04 CAL PEP · 1 PLT EST RE-ROUTED" });
+      pushLog({ tag: "CANCEL", level: "info", msg: "S-04 CAFETERIA PRADALS · 1 PLT EST RE-ROUTED" });
       pushLog({ tag: "REPLAN", level: "ok", msg: "RTE-A → RTE-B · 6 STOPS · -11.4 KM" });
     }
     if (p.kind === "reset") {
@@ -166,6 +167,11 @@ export default function Page() {
     pushLog({ tag: "MODE", level: "info", msg: `LOAD-PLAN → ${m.toUpperCase()}` });
   }
 
+  function handleTruckTypeChange(t) {
+    setTruckType(t);
+    pushLog({ tag: "TRUCK", level: "info", msg: `VEHICLE → ${t} · ${TRUCK_TYPES[t].capacity} PLT` });
+  }
+
   function handleWeightChange(key, val) {
     setWeights(w => {
       const others = Object.keys(w).filter(k => k !== key);
@@ -182,6 +188,7 @@ export default function Page() {
     });
   }
 
+  const spec = TRUCK_TYPES[truckType];
   const visibleStops = stops.filter(s => !s.cancelled);
   const completed = stops.filter(s => s.status === "completed" && !s.cancelled).length;
   const nextStop = visibleStops.find(s => s.status === "current") || visibleStops.find(s => s.status === "upcoming");
@@ -193,14 +200,14 @@ export default function Page() {
           <span className="chip red">DDI · INTERNAL</span>
           <span className="chip">OPS / DISPATCH</span>
           <span className="sep">/</span>
-          <span>TRUCK-04 · DRIVER MARTÍNEZ</span>
+          <span>TRK-04 · DRIVER MARTÍNEZ</span>
           <span className="sep">/</span>
-          <span>RTE-2026.05.09.A</span>
+          <span>DR0054 · MOLLET → VALLÈS</span>
         </div>
         <div className="cl-right">
           <span className="session">SESSION 0481</span>
           <span className="sep">·</span>
-          <span>NODE BCN-OPS-02</span>
+          <span>NODE MLT-OPS-01</span>
           <span className="sep">·</span>
           <span>CLEARANCE: DISPATCH</span>
         </div>
@@ -215,11 +222,11 @@ export default function Page() {
           <div className="header-meta">
             <span>MGR · M. PUIG</span>
             <span className="sep">·</span>
-            <span>TRK-04 · 8 PLT</span>
+            <span>{spec.code} · {spec.capacity} PLT</span>
             <span className="sep">·</span>
             <span>DRV · J. MARTÍNEZ</span>
             <span className="sep">·</span>
-            <span>MOLLET → BCN</span>
+            <span>MOLLET → VALLÈS</span>
           </div>
         </div>
         <div className="header-right">
@@ -237,7 +244,6 @@ export default function Page() {
         <MapPanel
           stops={stops}
           warehouse={WAREHOUSE}
-          neighborhoods={NEIGHBORHOODS}
           onStopHover={setHoveredStop}
           onStopClick={handleStopClick}
           hoveredPalletStops={hoveredPalletStops}
@@ -251,15 +257,19 @@ export default function Page() {
           onPalletHover={setHoveredPallet}
           onPalletClick={handlePalletClick}
           selectedClient={selectedClient}
-          returnableCount={returnableCount}
+          truckType={truckType}
+          onTruckTypeChange={handleTruckTypeChange}
         />
-        <CopilotPanel
-          messages={messages}
-          prompts={promptList}
-          onPrompt={handlePrompt}
-          isTyping={isTyping}
-          sysLog={sysLog}
-        />
+        <div className="right-stack">
+          <WarehousePanel />
+          <CopilotPanel
+            messages={messages}
+            prompts={promptList}
+            onPrompt={handlePrompt}
+            isTyping={isTyping}
+            sysLog={sysLog}
+          />
+        </div>
       </main>
 
       <div className="ops-ticker">
@@ -269,7 +279,7 @@ export default function Page() {
           <span className="tk-sep">/</span>
           <span className="tk-item">NEXT WAYPOINT <b>{nextStop ? nextStop.code : '—'}</b> · ETA <b>{nextStop ? nextStop.eta : '—'}</b></span>
           <span className="tk-sep">/</span>
-          <span className="tk-item">TRAFFIC <span className="green">●</span> NORMAL · DIAGONAL OK</span>
+          <span className="tk-item">TRAFFIC <span className="green">●</span> NORMAL · C-17 OK</span>
           <span className="tk-sep">/</span>
           <span className="tk-item">FUEL 73% · TEMP 4°C</span>
           <span className="tk-sep">/</span>
@@ -288,7 +298,7 @@ export default function Page() {
 
       <footer className="footer">
         <span>DDI SMART TRUCK · DISPATCHER CONSOLE · v0.4 · BUILD 2026.05.09</span>
-        <span>RUN ID: DDI-04-20260509-A · BCN-OPS-02 · MOLLET DEL VALLÈS</span>
+        <span>RUN ID: DDI-04-20260509-A · MLT-OPS-01 · MOLLET DEL VALLÈS</span>
       </footer>
     </div>
   );

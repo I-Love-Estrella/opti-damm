@@ -16,6 +16,12 @@
   --green: #16A34A;
   --warn: #FEF3C7;
 
+  --wh-shelf: #E8DFC8;
+  --wh-compact: #A89878;
+  --wh-rack: #CABFA0;
+  --wh-floor: #B8AC8B;
+  --wh-special: #C8102E;
+
   --serif: var(--font-fraunces), 'Times New Roman', serif;
   --sans: var(--font-manrope), system-ui, sans-serif;
   --mono: var(--font-jetbrains), ui-monospace, monospace;
@@ -227,6 +233,24 @@ button {
   grid-template-columns: 1.25fr 1fr 1fr;
   border-bottom: 1px solid var(--navy);
   overflow: hidden;
+}
+.right-stack {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: none;
+}
+.right-stack > .panel {
+  border-right: none;
+}
+.right-stack > .warehouse-panel {
+  flex: 0 0 auto;
+  max-height: 50%;
+  border-bottom: 1px solid var(--navy);
+}
+.right-stack > .copilot-panel {
+  flex: 1;
+  min-height: 0;
 }
 .panel {
   border-right: 1px solid var(--navy);
@@ -444,6 +468,46 @@ button {
   background: var(--navy);
   color: var(--cream);
 }
+
+/* truck type selector */
+.truck-type-toggle {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+.truck-type-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--navy-20);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--navy-60);
+  transition: all 0.15s;
+}
+.truck-type-btn .tt-sub {
+  font-weight: 400;
+  font-size: 9px;
+  color: var(--navy-40);
+  letter-spacing: 0.06em;
+}
+.truck-type-btn:hover:not(.active) {
+  border-color: var(--navy-40);
+  color: var(--navy);
+}
+.truck-type-btn.active {
+  border-color: var(--navy);
+  color: var(--navy);
+  background: var(--cream-2);
+}
+.truck-type-btn.active .tt-sub { color: var(--navy-60); }
 
 .truck-wrap {
   background: var(--cream-2);
@@ -1141,6 +1205,117 @@ button {
   border-top: 1.5px dashed var(--red);
   height: 0;
   width: 14px;
+}
+
+/* ───── warehouse panel ───── */
+.warehouse-panel {
+  padding: 16px 20px;
+}
+.wh-caption {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  color: var(--navy-60);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.wh-grid-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: var(--cream-2);
+  border: 1px solid var(--navy-20);
+  padding: 18px 10px 14px;
+  overflow: hidden;
+}
+.wh-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.wh-label-svg {
+  font-family: var(--mono);
+  font-size: 5px;
+  fill: var(--navy-40);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.wh-legend {
+  margin-top: 8px;
+  border: 1px solid var(--navy-20);
+}
+.wh-legend-head {
+  background: var(--cream-2);
+  border-bottom: 1px solid var(--navy-20);
+  padding: 3px 8px;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.18em;
+  color: var(--navy-60);
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.wh-legend-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+}
+.wh-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  border-right: 1px solid var(--navy-10);
+}
+.wh-legend-item:last-child { border-right: none; }
+.wh-swatch {
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--navy-20);
+  flex-shrink: 0;
+}
+.wh-swatch[data-wh="1"] { background: var(--wh-shelf); }
+.wh-swatch[data-wh="2"] { background: var(--wh-compact); }
+.wh-swatch[data-wh="3"] { background: var(--wh-rack); }
+.wh-swatch[data-wh="4"] { background: var(--wh-floor); }
+.wh-swatch[data-wh="9"] { background: var(--wh-special); }
+.wh-legend-label {
+  font-weight: 600;
+  color: var(--navy);
+}
+.wh-legend-count {
+  color: var(--navy-40);
+  font-size: 8.5px;
+}
+.wh-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0;
+  margin-top: 6px;
+  border: 1px solid var(--navy-20);
+}
+.wh-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px 8px;
+  border-right: 1px solid var(--navy-10);
+  font-family: var(--mono);
+}
+.wh-stat:last-child { border-right: none; }
+.wh-stat-label {
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  color: var(--navy-60);
+  text-transform: uppercase;
+}
+.wh-stat-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--navy);
 }
 
 /* system log strip in co-pilot */

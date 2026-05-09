@@ -27,7 +27,7 @@ from simulator.domain.commands import (
     ReturnDepot,
     Unload,
 )
-from simulator.domain.pallet import PalletKind
+from simulator.domain.pallet import PalletClass, PalletKind, sku_class_for_uma
 from simulator.domain.plan import Plan
 from simulator.domain.truck import build_slots
 
@@ -52,7 +52,10 @@ class ReplayBaseline(Algorithm):
         sku_blocks = self._sku_blocks(case)
         slots = list(build_slots(case.truck))
         slot_iter = iter(slots)
-        open_pallets: list[_OpenPallet] = []
+        open_by_class: dict[PalletClass, list[_OpenPallet]] = {
+            PalletClass.KEG: [],
+            PalletClass.BOX: [],
+        }
         unload_slot: dict[tuple[str, str], list[tuple[str, float]]] = {}
         overflow: list[tuple[str, str, float]] = []
         next_id = [0]
@@ -65,6 +68,8 @@ class ReplayBaseline(Algorithm):
             line = self._first_line(case, sku)
             if line is None:
                 continue
+            cls = sku_class_for_uma(line.uma)
+            open_pallets = open_by_class[cls]
             remaining = list(demands)
             while remaining:
                 cid, qty = remaining[0]
@@ -93,9 +98,10 @@ class ReplayBaseline(Algorithm):
                     open_pallets.remove(target)
                     cmds.append(Load(pallet_id=target.pallet_id, slot_id=target.slot_id))
 
-        for op in list(open_pallets):
-            cmds.append(Load(pallet_id=op.pallet_id, slot_id=op.slot_id))
-        open_pallets.clear()
+        for cls_pallets in open_by_class.values():
+            for op in list(cls_pallets):
+                cmds.append(Load(pallet_id=op.pallet_id, slot_id=op.slot_id))
+            cls_pallets.clear()
 
         if overflow:
             rationale.append(f"OVERFLOW: {len(overflow)} (sku, client) demands exceeded capacity.")

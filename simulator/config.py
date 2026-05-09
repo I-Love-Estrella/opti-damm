@@ -46,7 +46,7 @@ class TimeModel:
     road_factor: float = 1.30
     base_service_min: float = 8.0
     service_min_per_pallet: float = 1.5
-    service_min_per_search_move: float = 0.6
+    service_min_per_search_move: float = 0.1
     pallet_build_min: float = 5.0
     pick_min_per_sku: float = 2.0
     pick_min_per_box: float = 0.05

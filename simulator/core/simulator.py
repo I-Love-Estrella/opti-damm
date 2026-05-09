@@ -28,7 +28,13 @@ from simulator.domain.commands import (
     ReturnDepot,
     Unload,
 )
-from simulator.domain.pallet import Pallet, PalletItem, PalletKind
+from simulator.domain.pallet import (
+    Pallet,
+    PalletClass,
+    PalletItem,
+    PalletKind,
+    sku_class_for_uma,
+)
 from simulator.domain.plan import Plan
 
 
@@ -101,9 +107,21 @@ class Simulator:
             raise _CommandError(f"Pick onto unknown pallet {cmd.pallet_id}")
         order_line = _find_order_line(st.case, cmd.sku, cmd.intended_client)
         if order_line is None:
-            unit_v, unit_w = 0.001, 1.0
+            unit_v, unit_w, uma = 0.001, 1.0, "UN"
         else:
-            unit_v, unit_w = order_line.unit_volume_m3, order_line.unit_weight_kg
+            unit_v, unit_w, uma = (
+                order_line.unit_volume_m3,
+                order_line.unit_weight_kg,
+                order_line.uma,
+            )
+        item_class = sku_class_for_uma(uma)
+        if pallet.pallet_class is None:
+            pallet = pallet.with_class(item_class)
+        elif pallet.pallet_class != item_class:
+            st.capacity_violations += 1
+        col_x, col_y, bottom_level = pallet.suggest_position()
+        if bottom_level >= pallet.layout.max_level:
+            st.capacity_violations += 1
         item = PalletItem(
             sku=cmd.sku,
             qty=cmd.qty,
@@ -111,6 +129,9 @@ class Simulator:
             unit_weight_kg=unit_w,
             intended_client=cmd.intended_client,
             is_returnable_empty=False,
+            col_x=col_x,
+            col_y=col_y,
+            bottom_level=bottom_level,
         )
         new_pallet = pallet.add_item(item)
         if cmd.pallet_id in st.cargo.staging:
@@ -229,11 +250,18 @@ class Simulator:
                 items=tuple(),
                 primary_client=cmd.client_id,
                 notes="returnables",
+                pallet_class=PalletClass.KEG,
             )
             st.cargo.pallet_by_id[empties.pallet_id] = empties
             st.cargo.pallet_by_slot[cmd.slot_id] = empties.pallet_id
             st.cargo.slot_by_pallet[empties.pallet_id] = cmd.slot_id
             pallet = empties
+        if pallet.pallet_class is None:
+            pallet = pallet.with_class(PalletClass.KEG)
+            st.cargo.pallet_by_id[pallet.pallet_id] = pallet
+        col_x, col_y, bottom_level = pallet.suggest_position()
+        if bottom_level >= pallet.layout.max_level:
+            st.capacity_violations += 1
         item = PalletItem(
             sku=cmd.sku,
             qty=cmd.qty,
@@ -241,6 +269,9 @@ class Simulator:
             unit_weight_kg=2.0,
             intended_client=None,
             is_returnable_empty=True,
+            col_x=col_x,
+            col_y=col_y,
+            bottom_level=bottom_level,
         )
         st.cargo.pallet_by_id[pallet.pallet_id] = pallet.add_item(item)
         st.picked_returns[(cmd.client_id, cmd.sku)] = (
@@ -266,23 +297,39 @@ class Simulator:
         log.emit(st.t_min, "SIM_END", algorithm=plan.algorithm, distance_km=st.distance_km)
 
     def _search_moves(self, pallet: Pallet, client: str, sku: str) -> int:
+        """Physical-access cost in number of physical units to lift off.
+
+        Convention: col_y is depth from the truck edge. col_y=0 is the door
+        side; larger col_y is deeper inside. To reach a target at column
+        (col_x, col_y, level), the driver must remove:
+
+          1. every unit in the same column above the target
+             (same col_x, same col_y, bottom_level > target.top_level)
+          2. every unit in any column closer to the edge
+             (any col_x, any level, col_y' < target.col_y)
+
+        Both buckets are summed as physical units (stack_size each).
+        """
         target_idx = -1
         for i, it in enumerate(pallet.items):
             if it.sku == sku and it.intended_client in (None, client):
                 target_idx = i
                 break
-        if target_idx <= 0:
+        if target_idx < 0:
             return 0
-        if pallet.kind == PalletKind.CLIENT_BLOCK and pallet.primary_client == client:
-            return 0
-        blocks = 0
-        last_was_other = False
-        for it in pallet.items[:target_idx]:
-            is_other = it.intended_client is not None and it.intended_client != client
-            if is_other and not last_was_other:
-                blocks += 1
-            last_was_other = is_other
-        return blocks
+
+        target = pallet.items[target_idx]
+        moves = 0
+        for j, it in enumerate(pallet.items):
+            if j == target_idx:
+                continue
+            same_column = it.col_x == target.col_x and it.col_y == target.col_y
+            if same_column and it.bottom_level > target.top_level:
+                moves += it.stack_size
+                continue
+            if it.col_y < target.col_y:
+                moves += it.stack_size
+        return moves
 
     def _check_time_window(self, client, st: WorldState) -> None:
         if not client.time_windows:

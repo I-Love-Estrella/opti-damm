@@ -2,34 +2,20 @@
 
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import dynamic from 'next/dynamic';
-import {
-  STOPS,
-  WAREHOUSE,
-  ZONES,
-  PALLETS_T6,
-  PALLETS_T8,
-  TRUCK_TYPES,
-} from '@/data';
 import TruckPanel from '@/components/TruckPanel';
 import CopilotPanel from '@/components/CopilotPanel';
 import MetricsBar from '@/components/MetricsBar';
 
 import { api, SIM_API_BASE } from '@/lib/api';
+import {
+  adaptStops,
+  adaptPallets,
+  adaptMetrics,
+  adaptDepot,
+  adaptTruck,
+} from '@/lib/adapters';
 
 const MapPanel = dynamic(() => import('@/components/MapPanel'), { ssr: false });
-
-const INITIAL_MESSAGES = [
-  { kind: "claude", text: 'Good morning, Manel. **Truck 04** is loaded — route DR0054 heading north from Mollet. Driver J. Martínez left the depot at 08:14. Three stops complete, four to go. The route is optimised for **distance first**, with a soft preference for grouping returnables.' },
-  { kind: "claude", text: 'Current ETA back at depot: **15:42**. Score: 87/100. Ask me anything — or pull a slider and I\'ll re-plan live.' },
-];
-
-const INITIAL_LOG = [
-  { t: "08:14:02", tag: "DEPART", level: "ok",   msg: "TRK-04 · DDI MOLLET DEPOT" },
-  { t: "08:42:18", tag: "STOP",   level: "ok",   msg: "S-01 LOS TERESITOS · 1 PLT DELIVERED" },
-  { t: "09:38:44", tag: "STOP",   level: "ok",   msg: "S-02 VIENA GRANOLLERS · 2 PLT DELIVERED" },
-  { t: "10:24:09", tag: "STOP",   level: "ok",   msg: "S-03 FRANKFURT LEO BOECK · 1 PLT DELIVERED" },
-  { t: "10:48:01", tag: "PING",   level: "info", msg: "GPS LOCK · 41.886°N 2.254°E · 23 KM/H" },
-];
 
 const SECTIONS = [
   { id: 'map', index: '01', title: 'Route' },
@@ -99,17 +85,12 @@ function DragHandle({ direction, onDrag }) {
 }
 
 export default function Page() {
-  const [stops] = useState(STOPS);
-  const [mode, setMode] = useState("reference");
-  const [truckType, setTruckType] = useState("T8");
   const [hoveredStop, setHoveredStop] = useState(null);
   const [hoveredPallet, setHoveredPallet] = useState(null);
   const [selectedClient, setSelectedClient] = useState(null);
-  const [messages, setMessages] = useState(INITIAL_MESSAGES);
+  const [messages, setMessages] = useState([]);
   const [isTyping, setIsTyping] = useState(false);
-  const [weights, setWeights] = useState({ route: 60, load: 25, unload: 15 });
-  const [now] = useState("10:48");
-  const [sysLog, setSysLog] = useState(INITIAL_LOG);
+  const [sysLog, setSysLog] = useState([]);
   const [collapsed, setCollapsed] = useState(new Set());
   const [fullscreenPanel, setFullscreenPanel] = useState(null);
   const [panelMenuOpen, setPanelMenuOpen] = useState(false);
@@ -117,6 +98,11 @@ export default function Page() {
   const [availableRoutes, setAvailableRoutes] = useState([]);
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [routeDetail, setRouteDetail] = useState(null);
+  const [algorithms, setAlgorithms] = useState([]);
+  const [selectedAlgo, setSelectedAlgo] = useState(null);
+  const [simulationResult, setSimulationResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
   const pdfMenuRef = useRef(null);
   const [colWidths, setColWidths] = useState({ map: 1.25, truck: 1, right: 1 });
   const [rightSplit, setRightSplit] = useState(0.5);
@@ -124,6 +110,12 @@ export default function Page() {
   const panelsRef = useRef(null);
   const dragStartWidths = useRef(null);
   const dragStartRightSplit = useRef(null);
+
+  const pushLog = useCallback((entry) => {
+    const d = new Date();
+    const t = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+    setSysLog(prev => [...prev, { t, ...entry }]);
+  }, []);
 
   const toggleCollapse = useCallback((id) => {
     setCollapsed(prev => {
@@ -158,13 +150,19 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
-    api.routes().then(routes => {
-      setAvailableRoutes(routes);
-      if (routes.length > 0 && !selectedRoute) {
-        setSelectedRoute(routes[0]);
-      }
-    }).catch(() => {});
-  }, []);
+    Promise.all([api.routes(), api.algorithms()])
+      .then(([routes, algos]) => {
+        setAvailableRoutes(routes || []);
+        if (routes?.length > 0) setSelectedRoute(routes[0]);
+        const algoList = algos?.algorithms || [];
+        setAlgorithms(algoList);
+        if (algoList.length > 0) {
+          setSelectedAlgo(algoList[0].name);
+          pushLog({ tag: 'ALGO', level: 'info', msg: `SELECTED · ${algoList[0].name.toUpperCase()}` });
+        }
+      })
+      .catch((err) => setError(err?.message || 'API unreachable'));
+  }, [pushLog]);
 
   useEffect(() => {
     if (!selectedRoute) return;
@@ -172,6 +170,28 @@ export default function Page() {
       .then(setRouteDetail)
       .catch(() => setRouteDetail(null));
   }, [selectedRoute]);
+
+  useEffect(() => {
+    if (!selectedRoute || !selectedAlgo) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    pushLog({ tag: 'SIM', level: 'info', msg: `RUN · ${selectedRoute.fecha} ${selectedRoute.ruta} · ${selectedAlgo.toUpperCase()}` });
+    api.run({ date: selectedRoute.fecha, ruta: selectedRoute.ruta, algo: selectedAlgo })
+      .then((res) => {
+        if (cancelled) return;
+        setSimulationResult(res);
+        pushLog({ tag: 'SIM', level: 'ok', msg: `OK · ${res?.stops?.length || 0} STOPS` });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err?.message || 'Simulation failed');
+        setSimulationResult(null);
+        pushLog({ tag: 'SIM', level: 'info', msg: `ERROR · ${err?.message || 'unknown'}` });
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [selectedRoute, selectedAlgo, pushLog]);
 
   useEffect(() => {
     if (!pdfMenuOpen) return;
@@ -211,7 +231,7 @@ export default function Page() {
   }, [collapsed, rightStackVisible, colWidths]);
 
   const appGridStyle = useMemo(() => ({
-    gridTemplateRows: `22px 50px 1fr 28px ${collapsed.has('metrics') ? '0' : '160px'} 26px`
+    gridTemplateRows: `22px 50px 1fr ${collapsed.has('metrics') ? '0' : '160px'} 26px`
   }), [collapsed]);
 
   const handleColDrag = useCallback((leftKey, rightKey) => (delta, done) => {
@@ -254,44 +274,16 @@ export default function Page() {
     setRightSplit(Math.max(0.15, Math.min(0.85, startFrac + deltaFrac)));
   }, [rightSplit]);
 
-  const pushLog = useCallback((entry) => {
-    const d = new Date();
-    const t = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
-    setSysLog(prev => [...prev, { t, ...entry }]);
-  }, []);
-
-  const palletSource = truckType === "T6" ? PALLETS_T6 : PALLETS_T8;
-
-  const pallets = useMemo(() => {
-    const base = palletSource[mode] || palletSource.reference;
-    const cancelled = stops.filter(s => s.cancelled).map(s => s.id);
-    return base.map(p => cancelled.includes(p.stop) ? { ...p, sku: null, stop: null, ret: false, client: null, wt: 0 } : p);
-  }, [mode, stops, palletSource]);
+  const stops = useMemo(() => simulationResult ? adaptStops(simulationResult) : [], [simulationResult]);
+  const pallets = useMemo(() => simulationResult ? adaptPallets(simulationResult) : [], [simulationResult]);
+  const depot = useMemo(() => simulationResult ? adaptDepot(simulationResult) : null, [simulationResult]);
+  const truck = useMemo(() => simulationResult ? adaptTruck(simulationResult) : null, [simulationResult]);
+  const kpis = useMemo(() => simulationResult ? adaptMetrics(simulationResult) : null, [simulationResult]);
 
   const filledPallets = pallets.filter(p => p.sku);
   const returnableCount = filledPallets.length
     ? Math.round((filledPallets.filter(p => p.ret).length / filledPallets.length) * 100)
     : 0;
-
-  const metrics = useMemo(() => {
-    const visible = stops.filter(s => !s.cancelled);
-    const cancelDelta = stops.length - visible.length;
-    const baseDist = 84 - (weights.load * 0.06) - (weights.unload * 0.04) + (weights.route * 0.02);
-    const baseTime = 7.4 - (weights.route * 0.012) - (weights.unload * 0.006) + (weights.load * 0.004);
-    const score = Math.round(
-      (weights.route * 0.42 + weights.load * 0.34 + weights.unload * 0.30) / 1.5 + 38
-    );
-    return {
-      distance: Math.max(40, baseDist - cancelDelta * 6.4),
-      time: Math.max(3, baseTime - cancelDelta * 0.55),
-      stops: visible.length,
-      score: Math.min(99, Math.max(40, score)),
-    };
-  }, [weights, stops]);
-
-  const visibleStops = stops.filter(s => !s.cancelled);
-  const completed = stops.filter(s => s.status === "completed" && !s.cancelled).length;
-  const nextStop = visibleStops.find(s => s.status === "current") || visibleStops.find(s => s.status === "upcoming");
 
   const buildCopilotContext = useCallback((overrides = {}) => {
     const routeSummary = routeDetail ? {
@@ -316,29 +308,23 @@ export default function Page() {
 
     return {
       selected_route: selectedRoute,
+      selected_algorithm: selectedAlgo,
       route_detail: routeSummary,
-      load_mode: mode,
-      truck_type: truckType,
       selected_client: selectedClient,
       hovered_stop: hoveredStop,
-      metrics,
-      weights,
-      visible_stops: visibleStops.map(s => ({
+      kpis: kpis?.all || null,
+      visible_stops: stops.map(s => ({
         id: s.id,
         code: s.code,
         name: s.name,
-        status: s.status,
-        window: s.window,
         eta: s.eta,
         pallets: s.pallets,
-        priority: s.priority,
-        cancelled: s.cancelled || false,
+        client_id: s.client_id,
       })),
       pallet_summary: {
         total_slots: pallets.length,
         filled_slots: filledPallets.length,
         returnable_percent: returnableCount,
-        mode,
         sample: pallets.filter(p => p.sku).slice(0, 16),
       },
       system_log: sysLog.slice(-8),
@@ -346,14 +332,12 @@ export default function Page() {
     };
   }, [
     selectedRoute,
+    selectedAlgo,
     routeDetail,
-    mode,
-    truckType,
     selectedClient,
     hoveredStop,
-    metrics,
-    weights,
-    visibleStops,
+    kpis,
+    stops,
     pallets,
     filledPallets.length,
     returnableCount,
@@ -401,9 +385,7 @@ export default function Page() {
   const hoveredPalletStops = hoveredPallet ? [hoveredPallet.stop] : [];
 
   function handleStopClick(stop) {
-    if (stop.status === "completed") return;
     setSelectedClient(stop);
-    setMode("client");
   }
 
   function handlePalletClick(p) {
@@ -411,50 +393,30 @@ export default function Page() {
     if (s) setSelectedClient(s);
   }
 
-  function handleModeChange(m) {
-    setMode(m);
-    pushLog({ tag: "MODE", level: "info", msg: `LOAD-PLAN → ${m.toUpperCase()}` });
-  }
+  const truckCode = truck?.code || '—';
+  const truckCap = truck?.capacity || 0;
+  const routeLabel = selectedRoute ? `${selectedRoute.fecha} · ${selectedRoute.ruta}` : '—';
+  const repartidor = routeDetail?.repartidor || '—';
 
-  function handleTruckTypeChange(t) {
-    setTruckType(t);
-    pushLog({ tag: "TRUCK", level: "info", msg: `VEHICLE → ${t} · ${TRUCK_TYPES[t].capacity} PLT` });
-  }
-
-  function handleWeightChange(key, val) {
-    setWeights(w => {
-      const others = Object.keys(w).filter(k => k !== key);
-      const remaining = 100 - val;
-      const oldOthersSum = others.reduce((acc, k) => acc + w[k], 0) || 1;
-      const next = { ...w, [key]: val };
-      others.forEach(k => {
-        next[k] = Math.max(0, Math.round(remaining * (w[k] / oldOthersSum)));
-      });
-      const sum = next.route + next.load + next.unload;
-      const diff = 100 - sum;
-      next[others[0]] = Math.max(0, next[others[0]] + diff);
-      return next;
-    });
-  }
-
-  const spec = TRUCK_TYPES[truckType];
   return (
     <div className="app" style={appGridStyle}>
       <div className="classification">
         <div className="cl-left">
-          <span className="chip red">DDI &middot; INTERNAL</span>
+          <span className="chip red">DDI &middot; PLANNING CONSOLE</span>
           <span className="chip">OPS / DISPATCH</span>
           <span className="sep">/</span>
-          <span>TRK-04 &middot; DRIVER MART&Iacute;NEZ</span>
-          <span className="sep">/</span>
-          <span>DR0054 &middot; MOLLET &rarr; VALL&Egrave;S</span>
+          <span>{routeLabel}</span>
+          {truck && (
+            <>
+              <span className="sep">/</span>
+              <span>{truckCode} &middot; {truckCap} PLT</span>
+            </>
+          )}
         </div>
         <div className="cl-right">
-          <span className="session">SESSION 0481</span>
+          <span>{selectedAlgo ? `ALGO · ${selectedAlgo.toUpperCase()}` : 'ALGO · —'}</span>
           <span className="sep">&middot;</span>
-          <span>NODE MLT-OPS-01</span>
-          <span className="sep">&middot;</span>
-          <span>CLEARANCE: DISPATCH</span>
+          <span>{loading ? 'PLANNING…' : error ? 'API OFFLINE' : 'READY'}</span>
         </div>
       </div>
 
@@ -465,13 +427,49 @@ export default function Page() {
             <span className="smart">Smart Truck</span>
           </div>
           <div className="header-meta">
-            <span>MGR &middot; M. PUIG</span>
+            <label style={{display:'flex', alignItems:'center', gap:6}}>
+              <span style={{fontSize:11, opacity:0.6, textTransform:'uppercase', letterSpacing:'0.05em'}}>Route</span>
+              <select
+                value={selectedRoute ? `${selectedRoute.fecha}|${selectedRoute.ruta}` : ''}
+                onChange={(e) => {
+                  const [fecha, ruta] = e.target.value.split('|');
+                  const r = availableRoutes.find(r => r.fecha === fecha && r.ruta === ruta);
+                  if (r) setSelectedRoute(r);
+                }}
+                style={{
+                  fontFamily:'var(--mono)', fontSize:12, padding:'3px 6px',
+                  background:'var(--cream, #faf9f6)', border:'1px solid #ccc', borderRadius:4
+                }}
+              >
+                {availableRoutes.map(r => (
+                  <option key={`${r.fecha}|${r.ruta}`} value={`${r.fecha}|${r.ruta}`}>
+                    {r.fecha} · {r.ruta} · {r.clients} clients
+                  </option>
+                ))}
+              </select>
+            </label>
             <span className="sep">&middot;</span>
-            <span>{spec.code} &middot; {spec.capacity} PLT</span>
-            <span className="sep">&middot;</span>
-            <span>DRV &middot; J. MART&Iacute;NEZ</span>
-            <span className="sep">&middot;</span>
-            <span>MOLLET &rarr; VALL&Egrave;S</span>
+            <label style={{display:'flex', alignItems:'center', gap:6}}>
+              <span style={{fontSize:11, opacity:0.6, textTransform:'uppercase', letterSpacing:'0.05em'}}>Algo</span>
+              <select
+                value={selectedAlgo || ''}
+                onChange={(e) => setSelectedAlgo(e.target.value)}
+                style={{
+                  fontFamily:'var(--mono)', fontSize:12, padding:'3px 6px',
+                  background:'var(--cream, #faf9f6)', border:'1px solid #ccc', borderRadius:4
+                }}
+              >
+                {algorithms.map(a => (
+                  <option key={a.name} value={a.name}>{a.name}</option>
+                ))}
+              </select>
+            </label>
+            {repartidor !== '—' && (
+              <>
+                <span className="sep">&middot;</span>
+                <span>DRV &middot; {repartidor}</span>
+              </>
+            )}
           </div>
         </div>
         <div className="header-right">
@@ -480,61 +478,35 @@ export default function Page() {
               <span className="pm-icon">⎙</span>
               Documents
             </button>
-            {pdfMenuOpen && (
+            {pdfMenuOpen && selectedRoute && (
               <div className="panel-menu" style={{ width: 320 }}>
-                <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--navy-20, #ccc)' }}>
-                  <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', opacity: 0.6 }}>Route</label>
-                  <select
-                    value={selectedRoute ? `${selectedRoute.fecha}|${selectedRoute.ruta}` : ''}
-                    onChange={(e) => {
-                      const [fecha, ruta] = e.target.value.split('|');
-                      const r = availableRoutes.find(r => r.fecha === fecha && r.ruta === ruta);
-                      if (r) setSelectedRoute(r);
-                    }}
-                    style={{
-                      display: 'block', width: '100%', marginTop: 4, padding: '4px 6px',
-                      fontFamily: 'var(--mono)', fontSize: 12, background: 'var(--cream, #faf9f6)',
-                      border: '1px solid #ccc', borderRadius: 4
-                    }}
-                  >
-                    {availableRoutes.map(r => (
-                      <option key={`${r.fecha}|${r.ruta}`} value={`${r.fecha}|${r.ruta}`}>
-                        {r.fecha} · {r.ruta} · {r.clients} clients
-                      </option>
-                    ))}
-                  </select>
+                <button
+                  className="pm-item"
+                  onClick={() => { openPdf(`/pdf/hoja-carga/${selectedRoute.fecha}/${selectedRoute.ruta}`); setPdfMenuOpen(false); }}
+                >
+                  <span className="pm-idx">HC</span>
+                  <span className="pm-label">Hoja de Carga</span>
+                </button>
+                <button
+                  className="pm-item"
+                  onClick={() => { openPdf(`/pdf/hoja-ruta/${selectedRoute.fecha}/${selectedRoute.ruta}`); setPdfMenuOpen(false); }}
+                >
+                  <span className="pm-idx">HR</span>
+                  <span className="pm-label">Hoja de Ruta</span>
+                </button>
+                <div style={{ padding: '4px 10px 2px', borderTop: '1px solid var(--navy-20, #ccc)' }}>
+                  <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', opacity: 0.6 }}>Albaranes</label>
                 </div>
-                {selectedRoute && (
-                  <>
-                    <button
-                      className="pm-item"
-                      onClick={() => { openPdf(`/pdf/hoja-carga/${selectedRoute.fecha}/${selectedRoute.ruta}`); setPdfMenuOpen(false); }}
-                    >
-                      <span className="pm-idx">HC</span>
-                      <span className="pm-label">Hoja de Carga</span>
-                    </button>
-                    <button
-                      className="pm-item"
-                      onClick={() => { openPdf(`/pdf/hoja-ruta/${selectedRoute.fecha}/${selectedRoute.ruta}`); setPdfMenuOpen(false); }}
-                    >
-                      <span className="pm-idx">HR</span>
-                      <span className="pm-label">Hoja de Ruta</span>
-                    </button>
-                    <div style={{ padding: '4px 10px 2px', borderTop: '1px solid var(--navy-20, #ccc)' }}>
-                      <label style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', opacity: 0.6 }}>Albaranes</label>
-                    </div>
-                    {routeDetail && routeDetail.orders.map(order => (
-                      <button
-                        key={order.client_id}
-                        className="pm-item"
-                        onClick={() => { openPdf(`/pdf/albaran/${selectedRoute.fecha}/${selectedRoute.ruta}/${order.client_id}`); setPdfMenuOpen(false); }}
-                      >
-                        <span className="pm-idx">AB</span>
-                        <span className="pm-label">{order.client_name || order.client_id}</span>
-                      </button>
-                    ))}
-                  </>
-                )}
+                {routeDetail && routeDetail.orders?.map(order => (
+                  <button
+                    key={order.client_id}
+                    className="pm-item"
+                    onClick={() => { openPdf(`/pdf/albaran/${selectedRoute.fecha}/${selectedRoute.ruta}/${order.client_id}`); setPdfMenuOpen(false); }}
+                  >
+                    <span className="pm-idx">AB</span>
+                    <span className="pm-label">{order.client_name || order.client_id}</span>
+                  </button>
+                ))}
               </div>
             )}
           </div>
@@ -560,28 +532,41 @@ export default function Page() {
               </div>
             )}
           </div>
-          <span className="status-line">
-            STOP {completed}/{visibleStops.length} &middot; NEXT {nextStop ? nextStop.code : '—'}
-          </span>
-          <span className="live-dot">
-            <span className="pulse"></span>
-            LIVE &middot; {now}
-          </span>
         </div>
       </header>
+
+      {error && (
+        <div style={{
+          gridColumn: '1 / -1',
+          padding: '8px 16px',
+          background: '#fde8e8',
+          color: '#a33',
+          fontFamily: 'var(--mono)',
+          fontSize: 12,
+          borderBottom: '1px solid #c88',
+        }}>
+          API error: {error}
+        </div>
+      )}
 
       <main className="panels" style={panelGridStyle} ref={panelsRef}>
         {!collapsed.has('map') && (
           <Section id="map" collapsed={false} fullscreen={fullscreenPanel === 'map'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen}>
-            <MapPanel
-              stops={stops}
-              warehouse={WAREHOUSE}
-              onStopHover={setHoveredStop}
-              onStopClick={handleStopClick}
-              hoveredPalletStops={hoveredPalletStops}
-              isFullscreen={fullscreenPanel === 'map'}
-              isCollapsed={false}
-            />
+            {depot ? (
+              <MapPanel
+                stops={stops}
+                warehouse={depot}
+                onStopHover={setHoveredStop}
+                onStopClick={handleStopClick}
+                hoveredPalletStops={hoveredPalletStops}
+                isFullscreen={fullscreenPanel === 'map'}
+                isCollapsed={false}
+              />
+            ) : (
+              <div style={{padding:24, fontFamily:'var(--mono)', opacity:0.6}}>
+                {loading ? 'Loading simulation…' : 'No plan yet — pick a route + algorithm.'}
+              </div>
+            )}
             {!collapsed.has('truck') && <DragHandle direction="horizontal" onDrag={handleColDrag('map', 'truck')} />}
             {collapsed.has('truck') && rightStackVisible && <DragHandle direction="horizontal" onDrag={handleColDrag('map', 'right')} />}
           </Section>
@@ -589,18 +574,21 @@ export default function Page() {
 
         {!collapsed.has('truck') && (
           <Section id="truck" collapsed={false} fullscreen={fullscreenPanel === 'truck'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen}>
-            <TruckPanel
-              mode={mode}
-              onModeChange={handleModeChange}
-              pallets={pallets}
-              hoveredStop={hoveredStop}
-              hoveredPallet={hoveredPallet}
-              onPalletHover={setHoveredPallet}
-              onPalletClick={handlePalletClick}
-              selectedClient={selectedClient}
-              truckType={truckType}
-              onTruckTypeChange={handleTruckTypeChange}
-            />
+            {truck ? (
+              <TruckPanel
+                pallets={pallets}
+                hoveredStop={hoveredStop}
+                hoveredPallet={hoveredPallet}
+                onPalletHover={setHoveredPallet}
+                onPalletClick={handlePalletClick}
+                selectedClient={selectedClient}
+                truck={truck}
+              />
+            ) : (
+              <div style={{padding:24, fontFamily:'var(--mono)', opacity:0.6}}>
+                {loading ? 'Loading load plan…' : 'No load plan.'}
+              </div>
+            )}
             {rightStackVisible && <DragHandle direction="horizontal" onDrag={handleColDrag('truck', 'right')} />}
           </Section>
         )}
@@ -621,35 +609,13 @@ export default function Page() {
         )}
       </main>
 
-      <div className="ops-ticker">
-        <span className="tk-label">OPS &middot; LIVE</span>
-        <div className="tk-feed">
-          <span className="tk-item"><b>RTE-A</b> &middot; 6.2 KM REMAINING</span>
-          <span className="tk-sep">/</span>
-          <span className="tk-item">NEXT WAYPOINT <b>{nextStop ? nextStop.code : '—'}</b> &middot; ETA <b>{nextStop ? nextStop.eta : '—'}</b></span>
-          <span className="tk-sep">/</span>
-          <span className="tk-item">TRAFFIC <span className="green">&bull;</span> NORMAL &middot; C-17 OK</span>
-          <span className="tk-sep">/</span>
-          <span className="tk-item">FUEL 73% &middot; TEMP 4&deg;C</span>
-          <span className="tk-sep">/</span>
-          <span className="tk-item">TELEMATICS <span className="green">&bull;</span> SYNC</span>
-          <span className="tk-sep">/</span>
-          <span className="tk-item">DEPOT RETURN <b>15:42</b></span>
-        </div>
-        <span className="tk-time">{now}:23 CET</span>
-      </div>
-
       <Section id="metrics" collapsed={collapsed.has('metrics')} fullscreen={fullscreenPanel === 'metrics'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen} dark>
-        <MetricsBar
-          weights={weights}
-          onWeightChange={handleWeightChange}
-          metrics={metrics}
-        />
+        <MetricsBar kpis={kpis} fullscreen={fullscreenPanel === 'metrics'} />
       </Section>
 
       <footer className="footer">
-        <span>DDI SMART TRUCK &middot; DISPATCHER CONSOLE &middot; v0.4 &middot; BUILD 2026.05.09</span>
-        <span>RUN ID: DDI-04-20260509-A &middot; MLT-OPS-01 &middot; MOLLET DEL VALL&Egrave;S</span>
+        <span>DDI SMART TRUCK &middot; PLANNING CONSOLE &middot; v0.5</span>
+        <span>{selectedRoute ? `${selectedRoute.fecha} · ${selectedRoute.ruta}` : '—'} {selectedAlgo ? `· ${selectedAlgo}` : ''}</span>
       </footer>
 
       {fullscreenPanel && <div className="fullscreen-backdrop" onClick={() => setFullscreenPanel(null)} />}

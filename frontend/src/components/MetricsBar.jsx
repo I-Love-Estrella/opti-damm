@@ -28,7 +28,7 @@ function useCountUp(target, duration = 350) {
 }
 
 function Stat({ label, value, unit, format }) {
-  const v = useCountUp(value);
+  const v = useCountUp(typeof value === 'number' ? value : 0);
   const display = format ? format(v) : Math.round(v);
   return (
     <div className="stat">
@@ -41,54 +41,116 @@ function Stat({ label, value, unit, format }) {
   );
 }
 
-export default function MetricsBar({ weights, onWeightChange, metrics }) {
-  function fmtTime(h) {
-    const hh = Math.floor(h);
-    const mm = Math.round((h - hh) * 60);
-    return `${hh}:${String(mm).padStart(2, '0')}`;
-  }
+const FOCUSED = [
+  { key: 'total_km',       label: 'Distance',     unit: 'km',  format: (v) => v.toFixed(1) },
+  { key: 'total_minutes',  label: 'Time',         unit: 'min', format: (v) => Math.round(v) },
+  { key: 'total_cost_eur', label: 'Cost',         unit: '€',   format: (v) => v.toFixed(0) },
+  { key: 'co2_kg',         label: 'CO₂',          unit: 'kg',  format: (v) => v.toFixed(1) },
+  { key: 'search_moves',   label: 'Search moves', unit: '',    format: (v) => Math.round(v) },
+  { key: 'fill_rate',      label: 'Fill rate',    unit: '%',   format: (v) => (v * 100).toFixed(0) },
+];
 
-  const captions = {
-    route: "minimize distance",
-    load:  "maximize utilization",
-    unload: "minimize per-stop time",
-  };
-  const labels = {
-    route: "Route",
-    load:  "Load",
-    unload: "Unload",
-  };
+const GROUPS = [
+  {
+    title: 'Cost',
+    items: [
+      { key: 'total_cost_eur', label: 'Total cost', unit: '€', format: (v) => v.toFixed(2) },
+      { key: 'fuel_eur',       label: 'Fuel',       unit: '€', format: (v) => v.toFixed(2) },
+      { key: 'labor_eur',      label: 'Labor',      unit: '€', format: (v) => v.toFixed(2) },
+      { key: 'wear_eur',       label: 'Wear',       unit: '€', format: (v) => v.toFixed(2) },
+      { key: 'fuel_liters',    label: 'Fuel',       unit: 'L', format: (v) => v.toFixed(2) },
+    ],
+  },
+  {
+    title: 'Time',
+    items: [
+      { key: 'total_minutes',    label: 'Total',    unit: 'min', format: (v) => v.toFixed(1) },
+      { key: 'drive_minutes',    label: 'Drive',    unit: 'min', format: (v) => v.toFixed(1) },
+      { key: 'service_minutes',  label: 'Service',  unit: 'min', format: (v) => v.toFixed(1) },
+      { key: 'overhead_minutes', label: 'Overhead', unit: 'min', format: (v) => v.toFixed(1) },
+      { key: 'tw_violations_min',label: 'TW viol.', unit: 'min', format: (v) => v.toFixed(1) },
+    ],
+  },
+  {
+    title: 'Efficiency',
+    items: [
+      { key: 'total_km',                label: 'Distance',    unit: 'km', format: (v) => v.toFixed(1) },
+      { key: 'fill_rate',               label: 'Fill rate',   unit: '%',  format: (v) => (v * 100).toFixed(1) },
+      { key: 'pallet_volume_util',      label: 'Vol. util',   unit: '%',  format: (v) => (v * 100).toFixed(1) },
+      { key: 'weight_util',             label: 'Wt. util',    unit: '%',  format: (v) => (v * 100).toFixed(1) },
+      { key: 'pallets_loaded',          label: 'Pallets',     unit: '',   format: (v) => Math.round(v) },
+      { key: 'search_moves',            label: 'Search moves',unit: '',   format: (v) => Math.round(v) },
+      { key: 'delivered_units',         label: 'Delivered',   unit: 'u',  format: (v) => v.toFixed(0) },
+      { key: 'ordered_units',           label: 'Ordered',     unit: 'u',  format: (v) => v.toFixed(0) },
+      { key: 'returnables_picked_units',label: 'Returns',     unit: 'u',  format: (v) => v.toFixed(0) },
+    ],
+  },
+  {
+    title: 'Service',
+    items: [
+      { key: 'n_clients_planned',  label: 'Planned',    unit: '',  format: (v) => Math.round(v) },
+      { key: 'n_clients_visited',  label: 'Visited',    unit: '',  format: (v) => Math.round(v) },
+      { key: 'closed_visits',      label: 'Closed',     unit: '',  format: (v) => Math.round(v) },
+      { key: 'capacity_violations',label: 'Cap. viol.', unit: '',  format: (v) => Math.round(v) },
+      { key: 'drops',              label: 'Drops',      unit: '',  format: (v) => Math.round(v) },
+    ],
+  },
+  {
+    title: 'Environment',
+    items: [
+      { key: 'co2_kg', label: 'CO₂', unit: 'kg', format: (v) => v.toFixed(2) },
+    ],
+  },
+];
 
-  return (
-    <div className="metrics">
-      <div className="weights">
-        <div className="weights-head">Optimization weights — make the trade-offs visible</div>
-        <div className="sliders">
-          {["route", "load", "unload"].map(key => (
-            <div key={key} className="slider-block">
-              <div className="slider-row">
-                <span className="slider-label">{labels[key]}</span>
-                <span className="slider-value">{weights[key]}%</span>
+export default function MetricsBar({ kpis, fullscreen }) {
+  const all = kpis?.all || {};
+  const empty = !kpis;
+
+  if (fullscreen) {
+    return (
+      <div className="metrics metrics-full" style={{ padding: 16, overflow: 'auto' }}>
+        <div className="stats-head" style={{ marginBottom: 12 }}>
+          {empty ? 'Awaiting simulation…' : 'All KPIs'}
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
+          {GROUPS.map((g) => (
+            <div key={g.title}>
+              <div style={{ fontSize: 11, opacity: 0.6, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+                {g.title}
               </div>
-              <input
-                type="range"
-                min="0" max="100" step="1"
-                value={weights[key]}
-                onChange={(e) => onWeightChange(key, parseInt(e.target.value))}
-                className="slider"
-              />
-              <div className="slider-caption">{captions[key]}</div>
+              <div className="stats-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                {g.items.map((it) => (
+                  <Stat
+                    key={it.key}
+                    label={it.label}
+                    value={all[it.key] ?? 0}
+                    unit={it.unit}
+                    format={it.format}
+                  />
+                ))}
+              </div>
             </div>
           ))}
         </div>
       </div>
-      <div className="stats">
-        <div className="stats-head">Live metrics</div>
+    );
+  }
+
+  return (
+    <div className="metrics">
+      <div className="stats" style={{ width: '100%' }}>
+        <div className="stats-head">{empty ? 'Awaiting simulation…' : 'KPIs'}</div>
         <div className="stats-grid">
-          <Stat label="Distance" value={metrics.distance} unit="km" />
-          <Stat label="Time"     value={metrics.time}     unit="h" format={fmtTime} />
-          <Stat label="Stops"    value={metrics.stops} />
-          <Stat label="Score"    value={metrics.score}    unit="/100" />
+          {FOCUSED.map((it) => (
+            <Stat
+              key={it.key}
+              label={it.label}
+              value={all[it.key] ?? 0}
+              unit={it.unit}
+              format={it.format}
+            />
+          ))}
         </div>
       </div>
     </div>

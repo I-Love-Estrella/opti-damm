@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import dynamic from 'next/dynamic';
 import {
   STOPS,
@@ -22,7 +22,7 @@ const PROMPT_DEFS = [
   { id: "compare",  label: "Compare loading modes",        kind: "compare-load" },
   { id: "traffic",  label: "Traffic on C-17 14:00",        kind: "traffic", alert: true },
   { id: "cancel",   label: "Cancel Cafeteria Pradals",     kind: "cancel",  alert: true },
-  { id: "reset",    label: "↻ Reset scenario",             kind: "reset",   disabled: true },
+  { id: "reset",    label: "↻ Reset scenario",        kind: "reset",   disabled: true },
 ];
 
 const INITIAL_MESSAGES = [
@@ -38,6 +38,74 @@ const INITIAL_LOG = [
   { t: "10:48:01", tag: "PING",   level: "info", msg: "GPS LOCK · 41.886°N 2.254°E · 23 KM/H" },
 ];
 
+const SECTIONS = [
+  { id: 'map', index: '01', title: 'Route' },
+  { id: 'truck', index: '02', title: 'Load' },
+  { id: 'warehouse', index: '04', title: 'Warehouse' },
+  { id: 'copilot', index: '03', title: 'Co-pilot' },
+  { id: 'metrics', index: '—', title: 'Metrics' },
+];
+
+function Section({ id, collapsed, fullscreen, onToggleCollapse, onToggleFullscreen, dark, style, children }) {
+  const cls = [
+    'section',
+    collapsed && 'section-collapsed',
+    fullscreen && 'section-fullscreen',
+    dark && 'section-dark',
+  ].filter(Boolean).join(' ');
+
+  return (
+    <div className={cls} style={style}>
+      <div className="section-controls">
+        <button className="sc-btn" onClick={() => onToggleCollapse(id)} title="Hide panel">{'−'}</button>
+        <button className="sc-btn" onClick={() => onToggleFullscreen(id)} title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}>
+          {fullscreen ? '✕' : '⤢'}
+        </button>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function DragHandle({ direction, onDrag }) {
+  const handleRef = useRef(null);
+
+  const onMouseDown = useCallback((e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+
+    const onMouseMove = (e) => {
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      onDrag(direction === 'horizontal' ? dx : dy, false);
+    };
+
+    const onMouseUp = (e) => {
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      onDrag(direction === 'horizontal' ? dx : dy, true);
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    document.body.style.cursor = direction === 'horizontal' ? 'col-resize' : 'row-resize';
+    document.body.style.userSelect = 'none';
+  }, [direction, onDrag]);
+
+  return (
+    <div
+      ref={handleRef}
+      className={`drag-handle drag-handle-${direction}`}
+      onMouseDown={onMouseDown}
+    />
+  );
+}
+
 export default function Page() {
   const [stops, setStops] = useState(STOPS);
   const [mode, setMode] = useState("reference");
@@ -51,6 +119,113 @@ export default function Page() {
   const [weights, setWeights] = useState({ route: 60, load: 25, unload: 15 });
   const [now] = useState("10:48");
   const [sysLog, setSysLog] = useState(INITIAL_LOG);
+  const [collapsed, setCollapsed] = useState(new Set());
+  const [fullscreenPanel, setFullscreenPanel] = useState(null);
+  const [panelMenuOpen, setPanelMenuOpen] = useState(false);
+  const [colWidths, setColWidths] = useState({ map: 1.25, truck: 1, right: 1 });
+  const [rightSplit, setRightSplit] = useState(0.5);
+  const panelMenuRef = useRef(null);
+  const panelsRef = useRef(null);
+  const dragStartWidths = useRef(null);
+  const dragStartRightSplit = useRef(null);
+
+  const toggleCollapse = useCallback((id) => {
+    setCollapsed(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+    setFullscreenPanel(prev => prev === id ? null : prev);
+  }, []);
+
+  const toggleFullscreen = useCallback((id) => {
+    setFullscreenPanel(prev => prev === id ? null : id);
+    setCollapsed(prev => {
+      if (prev.has(id)) {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      }
+      return prev;
+    });
+  }, []);
+
+  useEffect(() => {
+    const handleKey = (e) => {
+      if (e.key === 'Escape') {
+        setFullscreenPanel(null);
+        setPanelMenuOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, []);
+
+  useEffect(() => {
+    if (!panelMenuOpen) return;
+    const handler = (e) => {
+      if (panelMenuRef.current && !panelMenuRef.current.contains(e.target)) {
+        setPanelMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [panelMenuOpen]);
+
+  const rightStackVisible = !collapsed.has('warehouse') || !collapsed.has('copilot');
+
+  const panelGridStyle = useMemo(() => {
+    const cols = [];
+    if (!collapsed.has('map')) cols.push(`${colWidths.map}fr`);
+    if (!collapsed.has('truck')) cols.push(`${colWidths.truck}fr`);
+    if (rightStackVisible) cols.push(`${colWidths.right}fr`);
+    if (cols.length === 0) cols.push('1fr');
+    return { gridTemplateColumns: cols.join(' ') };
+  }, [collapsed, rightStackVisible, colWidths]);
+
+  const appGridStyle = useMemo(() => ({
+    gridTemplateRows: `22px 50px 1fr 28px ${collapsed.has('metrics') ? '0' : '160px'} 26px`
+  }), [collapsed]);
+
+  const handleColDrag = useCallback((leftKey, rightKey) => (delta, done) => {
+    if (!panelsRef.current) return;
+    if (done) {
+      dragStartWidths.current = null;
+      return;
+    }
+    if (!dragStartWidths.current) {
+      dragStartWidths.current = { ...colWidths };
+    }
+    const start = dragStartWidths.current;
+    const totalWidth = panelsRef.current.offsetWidth;
+    const visibleKeys = ['map', 'truck', 'right'].filter(k =>
+      k === 'right' ? rightStackVisible : !collapsed.has(k)
+    );
+    const totalFr = visibleKeys.reduce((a, k) => a + start[k], 0);
+    const pxPerFr = totalWidth / totalFr;
+    const deltaFr = delta / pxPerFr;
+    setColWidths({
+      ...start,
+      [leftKey]: Math.max(0.3, start[leftKey] + deltaFr),
+      [rightKey]: Math.max(0.3, start[rightKey] - deltaFr),
+    });
+  }, [colWidths, collapsed, rightStackVisible]);
+
+  const handleRightStackDrag = useCallback((delta, done) => {
+    if (done) {
+      dragStartRightSplit.current = null;
+      return;
+    }
+    const stack = panelsRef.current?.querySelector('.right-stack');
+    if (!stack) return;
+    const totalHeight = stack.offsetHeight;
+    if (!dragStartRightSplit.current) {
+      dragStartRightSplit.current = rightSplit;
+    }
+    const startFrac = dragStartRightSplit.current;
+    const deltaFrac = delta / totalHeight;
+    setRightSplit(Math.max(0.15, Math.min(0.85, startFrac + deltaFrac)));
+  }, [rightSplit]);
 
   const pushLog = useCallback((entry) => {
     const d = new Date();
@@ -194,21 +369,21 @@ export default function Page() {
   const nextStop = visibleStops.find(s => s.status === "current") || visibleStops.find(s => s.status === "upcoming");
 
   return (
-    <div className="app">
+    <div className="app" style={appGridStyle}>
       <div className="classification">
         <div className="cl-left">
-          <span className="chip red">DDI · INTERNAL</span>
+          <span className="chip red">DDI &middot; INTERNAL</span>
           <span className="chip">OPS / DISPATCH</span>
           <span className="sep">/</span>
-          <span>TRK-04 · DRIVER MARTÍNEZ</span>
+          <span>TRK-04 &middot; DRIVER MART&Iacute;NEZ</span>
           <span className="sep">/</span>
-          <span>DR0054 · MOLLET → VALLÈS</span>
+          <span>DR0054 &middot; MOLLET &rarr; VALL&Egrave;S</span>
         </div>
         <div className="cl-right">
           <span className="session">SESSION 0481</span>
-          <span className="sep">·</span>
+          <span className="sep">&middot;</span>
           <span>NODE MLT-OPS-01</span>
-          <span className="sep">·</span>
+          <span className="sep">&middot;</span>
           <span>CLEARANCE: DISPATCH</span>
         </div>
       </div>
@@ -220,86 +395,138 @@ export default function Page() {
             <span className="smart">Smart Truck</span>
           </div>
           <div className="header-meta">
-            <span>MGR · M. PUIG</span>
-            <span className="sep">·</span>
-            <span>{spec.code} · {spec.capacity} PLT</span>
-            <span className="sep">·</span>
-            <span>DRV · J. MARTÍNEZ</span>
-            <span className="sep">·</span>
-            <span>MOLLET → VALLÈS</span>
+            <span>MGR &middot; M. PUIG</span>
+            <span className="sep">&middot;</span>
+            <span>{spec.code} &middot; {spec.capacity} PLT</span>
+            <span className="sep">&middot;</span>
+            <span>DRV &middot; J. MART&Iacute;NEZ</span>
+            <span className="sep">&middot;</span>
+            <span>MOLLET &rarr; VALL&Egrave;S</span>
           </div>
         </div>
         <div className="header-right">
+          <div className="panel-menu-wrap" ref={panelMenuRef}>
+            <button className="panel-menu-btn" onClick={() => setPanelMenuOpen(prev => !prev)}>
+              <span className="pm-icon">▦</span>
+              Panels
+              {collapsed.size > 0 && <span className="pm-badge">{collapsed.size}</span>}
+            </button>
+            {panelMenuOpen && (
+              <div className="panel-menu">
+                {SECTIONS.map(s => (
+                  <button
+                    key={s.id}
+                    className={`pm-item ${collapsed.has(s.id) ? 'pm-hidden' : ''}`}
+                    onClick={() => toggleCollapse(s.id)}
+                  >
+                    <span className={`pm-check ${collapsed.has(s.id) ? '' : 'pm-checked'}`} />
+                    <span className="pm-idx">{s.index}</span>
+                    <span className="pm-label">{s.title}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <span className="status-line">
-            STOP {completed}/{visibleStops.length} · NEXT {nextStop ? nextStop.code : '—'}
+            STOP {completed}/{visibleStops.length} &middot; NEXT {nextStop ? nextStop.code : '—'}
           </span>
           <span className="live-dot">
             <span className="pulse"></span>
-            LIVE · {now}
+            LIVE &middot; {now}
           </span>
         </div>
       </header>
 
-      <main className="panels">
-        <MapPanel
-          stops={stops}
-          warehouse={WAREHOUSE}
-          onStopHover={setHoveredStop}
-          onStopClick={handleStopClick}
-          hoveredPalletStops={hoveredPalletStops}
-        />
-        <TruckPanel
-          mode={mode}
-          onModeChange={handleModeChange}
-          pallets={pallets}
-          hoveredStop={hoveredStop}
-          hoveredPallet={hoveredPallet}
-          onPalletHover={setHoveredPallet}
-          onPalletClick={handlePalletClick}
-          selectedClient={selectedClient}
-          truckType={truckType}
-          onTruckTypeChange={handleTruckTypeChange}
-        />
-        <div className="right-stack">
-          <WarehousePanel />
-          <CopilotPanel
-            messages={messages}
-            prompts={promptList}
-            onPrompt={handlePrompt}
-            isTyping={isTyping}
-            sysLog={sysLog}
-          />
-        </div>
+      <main className="panels" style={panelGridStyle} ref={panelsRef}>
+        {!collapsed.has('map') && (
+          <Section id="map" collapsed={false} fullscreen={fullscreenPanel === 'map'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen}>
+            <MapPanel
+              stops={stops}
+              warehouse={WAREHOUSE}
+              onStopHover={setHoveredStop}
+              onStopClick={handleStopClick}
+              hoveredPalletStops={hoveredPalletStops}
+              isFullscreen={fullscreenPanel === 'map'}
+              isCollapsed={false}
+            />
+            {!collapsed.has('truck') && <DragHandle direction="horizontal" onDrag={handleColDrag('map', 'truck')} />}
+            {collapsed.has('truck') && rightStackVisible && <DragHandle direction="horizontal" onDrag={handleColDrag('map', 'right')} />}
+          </Section>
+        )}
+
+        {!collapsed.has('truck') && (
+          <Section id="truck" collapsed={false} fullscreen={fullscreenPanel === 'truck'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen}>
+            <TruckPanel
+              mode={mode}
+              onModeChange={handleModeChange}
+              pallets={pallets}
+              hoveredStop={hoveredStop}
+              hoveredPallet={hoveredPallet}
+              onPalletHover={setHoveredPallet}
+              onPalletClick={handlePalletClick}
+              selectedClient={selectedClient}
+              truckType={truckType}
+              onTruckTypeChange={handleTruckTypeChange}
+            />
+            {rightStackVisible && <DragHandle direction="horizontal" onDrag={handleColDrag('truck', 'right')} />}
+          </Section>
+        )}
+
+        {rightStackVisible && (
+          <div className="right-stack">
+            {!collapsed.has('warehouse') && (
+              <Section id="warehouse" collapsed={false} fullscreen={fullscreenPanel === 'warehouse'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen} style={!collapsed.has('copilot') ? { flex: `0 0 ${rightSplit * 100}%` } : undefined}>
+                <WarehousePanel />
+                {!collapsed.has('copilot') && <DragHandle direction="vertical" onDrag={handleRightStackDrag} />}
+              </Section>
+            )}
+            {!collapsed.has('copilot') && (
+              <Section id="copilot" collapsed={false} fullscreen={fullscreenPanel === 'copilot'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen}>
+                <CopilotPanel
+                  messages={messages}
+                  prompts={promptList}
+                  onPrompt={handlePrompt}
+                  isTyping={isTyping}
+                  sysLog={sysLog}
+                />
+              </Section>
+            )}
+          </div>
+        )}
       </main>
 
       <div className="ops-ticker">
-        <span className="tk-label">OPS · LIVE</span>
+        <span className="tk-label">OPS &middot; LIVE</span>
         <div className="tk-feed">
-          <span className="tk-item"><b>RTE-A</b> · 6.2 KM REMAINING</span>
+          <span className="tk-item"><b>RTE-A</b> &middot; 6.2 KM REMAINING</span>
           <span className="tk-sep">/</span>
-          <span className="tk-item">NEXT WAYPOINT <b>{nextStop ? nextStop.code : '—'}</b> · ETA <b>{nextStop ? nextStop.eta : '—'}</b></span>
+          <span className="tk-item">NEXT WAYPOINT <b>{nextStop ? nextStop.code : '—'}</b> &middot; ETA <b>{nextStop ? nextStop.eta : '—'}</b></span>
           <span className="tk-sep">/</span>
-          <span className="tk-item">TRAFFIC <span className="green">●</span> NORMAL · C-17 OK</span>
+          <span className="tk-item">TRAFFIC <span className="green">&bull;</span> NORMAL &middot; C-17 OK</span>
           <span className="tk-sep">/</span>
-          <span className="tk-item">FUEL 73% · TEMP 4°C</span>
+          <span className="tk-item">FUEL 73% &middot; TEMP 4&deg;C</span>
           <span className="tk-sep">/</span>
-          <span className="tk-item">TELEMATICS <span className="green">●</span> SYNC</span>
+          <span className="tk-item">TELEMATICS <span className="green">&bull;</span> SYNC</span>
           <span className="tk-sep">/</span>
           <span className="tk-item">DEPOT RETURN <b>15:42</b></span>
         </div>
         <span className="tk-time">{now}:23 CET</span>
       </div>
 
-      <MetricsBar
-        weights={weights}
-        onWeightChange={handleWeightChange}
-        metrics={metrics}
-      />
+      <Section id="metrics" collapsed={collapsed.has('metrics')} fullscreen={fullscreenPanel === 'metrics'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen} dark>
+        <MetricsBar
+          weights={weights}
+          onWeightChange={handleWeightChange}
+          metrics={metrics}
+        />
+      </Section>
 
       <footer className="footer">
-        <span>DDI SMART TRUCK · DISPATCHER CONSOLE · v0.4 · BUILD 2026.05.09</span>
-        <span>RUN ID: DDI-04-20260509-A · MLT-OPS-01 · MOLLET DEL VALLÈS</span>
+        <span>DDI SMART TRUCK &middot; DISPATCHER CONSOLE &middot; v0.4 &middot; BUILD 2026.05.09</span>
+        <span>RUN ID: DDI-04-20260509-A &middot; MLT-OPS-01 &middot; MOLLET DEL VALL&Egrave;S</span>
       </footer>
+
+      {fullscreenPanel && <div className="fullscreen-backdrop" onClick={() => setFullscreenPanel(null)} />}
     </div>
   );
 }

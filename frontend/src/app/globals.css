@@ -240,15 +240,12 @@ button {
   overflow: hidden;
   border-right: none;
 }
-.right-stack > .panel {
-  border-right: none;
-}
-.right-stack > .warehouse-panel {
-  flex: 0 0 auto;
-  max-height: 50%;
+.right-stack > .section:first-child {
+  flex: 0 0 50%;
   border-bottom: 1px solid var(--navy);
+  overflow: hidden;
 }
-.right-stack > .copilot-panel {
+.right-stack > .section:last-child {
   flex: 1;
   min-height: 0;
 }
@@ -261,7 +258,7 @@ button {
   min-width: 0;
   scrollbar-width: thin;
 }
-.panel:last-child { border-right: none; }
+.right-stack .panel { border-right: none; }
 
 .panel-head {
   display: flex;
@@ -1369,4 +1366,332 @@ button {
 @keyframes flash {
   0% { color: var(--red); }
   100% { color: inherit; }
+}
+
+/* ───── collapsible / fullscreen sections ───── */
+.section {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.section > .panel,
+.section > .metrics {
+  flex: 1;
+  min-height: 0;
+}
+
+/* controls */
+.section-controls {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 20;
+  display: flex;
+  gap: 3px;
+  opacity: 0.25;
+  transition: opacity 0.2s;
+}
+.section:hover .section-controls,
+.section-fullscreen .section-controls {
+  opacity: 1;
+}
+.sc-btn {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--navy-20);
+  background: rgba(244, 239, 227, 0.92);
+  color: var(--navy-60);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 0.15s;
+  padding: 0;
+}
+.sc-btn:hover {
+  border-color: var(--navy);
+  color: var(--navy);
+  background: var(--cream);
+}
+.section-dark .sc-btn {
+  background: rgba(10, 22, 40, 0.7);
+  border-color: rgba(244, 239, 227, 0.2);
+  color: rgba(244, 239, 227, 0.6);
+}
+.section-dark .sc-btn:hover {
+  border-color: rgba(244, 239, 227, 0.5);
+  color: var(--cream);
+  background: rgba(10, 22, 40, 0.95);
+}
+
+/* ───── panels dropdown ───── */
+.panel-menu-wrap {
+  position: relative;
+}
+.panel-menu-btn {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--navy-60);
+  padding: 5px 10px;
+  border: 1px solid var(--navy-20);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  transition: all 0.15s;
+  background: transparent;
+}
+.panel-menu-btn:hover,
+.panel-menu-btn:focus {
+  border-color: var(--navy);
+  color: var(--navy);
+}
+.pm-icon {
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.7;
+}
+.pm-badge {
+  background: var(--red);
+  color: var(--cream);
+  font-size: 8.5px;
+  min-width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+.panel-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: var(--cream);
+  border: 1px solid var(--navy);
+  z-index: 500;
+  min-width: 190px;
+  animation: menu-in 0.15s ease;
+}
+@keyframes menu-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.pm-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  width: 100%;
+  text-align: left;
+  border-bottom: 1px solid var(--navy-10);
+  transition: background 0.12s;
+  color: var(--navy);
+  background: none;
+  cursor: pointer;
+}
+.pm-item:last-child { border-bottom: none; }
+.pm-item:hover { background: var(--cream-2); }
+.pm-item.pm-hidden { color: var(--navy-40); }
+.pm-check {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid var(--navy-20);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.pm-check.pm-checked {
+  background: var(--navy);
+  border-color: var(--navy);
+}
+.pm-check.pm-checked::after {
+  content: '✓';
+  color: var(--cream);
+  font-size: 9px;
+  line-height: 1;
+}
+.pm-idx {
+  font-size: 9px;
+  color: var(--red);
+  font-weight: 600;
+  width: 16px;
+}
+.pm-item.pm-hidden .pm-idx {
+  color: var(--navy-20);
+}
+.pm-label {
+  flex: 1;
+}
+
+/* fully hide collapsed sections (kept mounted for Leaflet etc.) */
+.section-collapsed {
+  display: none !important;
+}
+.right-stack-hidden {
+  display: none !important;
+}
+/* when only one right-stack child is visible, let it fill */
+.right-stack:has(> .section-collapsed) > .section:not(.section-collapsed) {
+  flex: 1 !important;
+  max-height: none !important;
+  border-bottom: none !important;
+}
+
+/* fullscreen */
+.fullscreen-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 22, 40, 0.45);
+  z-index: 999;
+  animation: backdrop-in 0.2s ease;
+}
+@keyframes backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.section-fullscreen {
+  position: fixed !important;
+  inset: 12px !important;
+  z-index: 1000 !important;
+  background: var(--cream);
+  border: 1px solid var(--navy) !important;
+  max-height: none !important;
+  max-width: none !important;
+  flex: none !important;
+  animation: fullscreen-in 0.25s ease;
+}
+.section-fullscreen.section-dark {
+  background: var(--navy);
+}
+@keyframes fullscreen-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+.section-fullscreen .panel {
+  border-right: none;
+}
+.section-fullscreen .section-controls {
+  top: 18px;
+  right: 18px;
+}
+.section-fullscreen .sc-btn {
+  width: 26px;
+  height: 26px;
+  font-size: 16px;
+}
+
+/* ───── fullscreen panel refinements ───── */
+
+/* Truck + Copilot: constrain width for comfortable reading */
+.section-fullscreen > .truck-panel,
+.section-fullscreen > .copilot-panel {
+  max-width: 900px;
+  width: 100%;
+  align-self: center;
+  padding: 28px 36px;
+}
+
+/* Copilot: chat-like centered layout */
+.section-fullscreen .copilot-panel .msg {
+  max-width: 75%;
+}
+.section-fullscreen .copilot-panel .msg.alert {
+  max-width: 100%;
+}
+
+/* Warehouse: let SVG grid hero fill space, constrain bottom panels */
+.section-fullscreen > .warehouse-panel {
+  padding: 28px 36px;
+}
+.section-fullscreen .warehouse-panel .wh-legend,
+.section-fullscreen .warehouse-panel .wh-stats {
+  max-width: 720px;
+}
+
+/* Metrics: larger type and more breathing room */
+.section-fullscreen > .metrics {
+  align-content: center;
+}
+.section-fullscreen .weights {
+  padding: 40px 56px;
+}
+.section-fullscreen .stats {
+  padding: 40px 56px;
+}
+.section-fullscreen .stat-value {
+  font-size: 54px;
+}
+.section-fullscreen .slider-label {
+  font-size: 22px;
+}
+.section-fullscreen .slider {
+  margin: 10px 0 6px;
+}
+
+/* ───── drag handles for resizable panels ───── */
+.drag-handle {
+  position: absolute;
+  z-index: 30;
+  transition: background 0.15s;
+}
+.drag-handle::after {
+  content: '';
+  position: absolute;
+  background: var(--navy-20);
+  transition: background 0.15s;
+}
+.drag-handle:hover::after,
+.drag-handle:active::after {
+  background: var(--red);
+}
+
+.drag-handle-horizontal {
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+}
+.drag-handle-horizontal::after {
+  top: 0;
+  left: 3px;
+  width: 1px;
+  height: 100%;
+}
+
+.drag-handle-vertical {
+  bottom: -3px;
+  left: 0;
+  width: 100%;
+  height: 7px;
+  cursor: row-resize;
+}
+.drag-handle-vertical::after {
+  left: 0;
+  top: 3px;
+  width: 100%;
+  height: 1px;
+}
+
+/* smooth grid transitions (disabled during drag via inline override) */
+.panels {
+  transition: grid-template-columns 0.3s ease;
+}
+body[style*="cursor"] .panels {
+  transition: none;
 }

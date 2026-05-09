@@ -102,3 +102,9 @@ The frontend expects one backend base URL to serve all of these paths:
 /api/run
 /api/bench
 ```
+
+## Google Cloud backend-only VM
+
+For a backend-only Google Compute Engine deployment, keep the frontend on Vercel
+or local development and point `NEXT_PUBLIC_API_URL` at the VM. See
+[docs/google-cloud-backend-vm.md](docs/google-cloud-backend-vm.md).

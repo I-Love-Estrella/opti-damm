@@ -20,7 +20,7 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata = {
-  title: 'DDI Smart Truck · Dispatcher Console',
+  title: 'Beerantir — operational intelligence for beverage logistics',
 };
 
 export default function RootLayout({ children }) {

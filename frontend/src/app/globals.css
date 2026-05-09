@@ -30,14 +30,20 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body {
-  height: 100%;
   background: var(--cream);
   color: var(--navy);
   font-family: var(--sans);
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+body:has(.app) {
+  height: 100%;
   overflow: hidden;
+}
+html:has(.app) {
+  height: 100%;
 }
 
 button {

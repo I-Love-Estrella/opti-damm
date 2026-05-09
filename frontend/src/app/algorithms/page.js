@@ -1,9 +1,69 @@
 'use client';
 
-import { useEffect, useMemo, useState, useCallback } from 'react';
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { api, SIM_API_BASE } from '@/lib/api';
+import TruckLoadView from '@/components/TruckLoadView';
+import StopTimeline from '@/components/StopTimeline';
+import StepPlayer from '@/components/StepPlayer';
+import ActionLog from '@/components/ActionLog';
+import { cargoStateAt, flattenStages, buildLiftReplaceMap } from '@/lib/cargoState';
 import './algorithms.css';
+
+const RouteMap = dynamic(() => import('@/components/RouteMap'), { ssr: false });
+const Truck3D = dynamic(() => import('@/components/Truck3D'), { ssr: false });
+
+function Playback3D({ run }) {
+  const stops = run?.data?.stops || [];
+  const initialCargo = run?.data?.initial_cargo || [];
+  const truck = run?.data?.truck;
+
+  const flatStages = useMemo(() => flattenStages(stops), [stops]);
+  const liftMaps = useMemo(() => buildLiftReplaceMap(flatStages), [flatStages]);
+  const [idx, setIdx] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [speed, setSpeed] = useState(2);
+  const rootRef = useRef(null);
+
+  const state = useMemo(
+    () => cargoStateAt(initialCargo, flatStages, idx),
+    [initialCargo, flatStages, idx],
+  );
+
+  if (!truck || flatStages.length === 0) return null;
+
+  return (
+    <div className="playback3d" ref={rootRef}>
+      <Truck3D
+        truck={truck}
+        palletsBySlot={state.palletsBySlot}
+        boxes={state.boxes}
+        highlightSeq={idx > 0 ? idx - 1 : undefined}
+        height={480}
+      />
+      <StepPlayer
+        stages={flatStages}
+        idx={idx}
+        onIdxChange={(updater) => {
+          if (typeof updater === 'function') setIdx((c) => updater(c));
+          else setIdx(updater);
+        }}
+        isPlaying={isPlaying}
+        onPlayingChange={setIsPlaying}
+        liftMaps={liftMaps}
+        speed={speed}
+        onSpeedChange={setSpeed}
+        rootRef={rootRef}
+      />
+      <ActionLog
+        stages={flatStages}
+        idx={idx}
+        onSelectIdx={setIdx}
+      />
+    </div>
+  );
+}
 
 const KPI_CARDS = [
   { key: 'total_minutes',    label: 'Total minutes',    fmt: (v) => v.toFixed(1),     unit: 'min',   lowerBetter: true },
@@ -126,6 +186,46 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
                 ))}
                 <span className="route-chip depot">DEPOT</span>
               </div>
+            </div>
+          )}
+
+          {run?.data?.stops?.length > 0 && run?.data?.depot && (
+            <div className="viz-section">
+              <h4>Route map</h4>
+              <RouteMap
+                depot={run.data.depot}
+                stops={run.data.stops}
+                legs={run.data.legs || []}
+                height={340}
+              />
+            </div>
+          )}
+
+          {run?.data?.initial_cargo?.length > 0 && run?.data?.truck && (
+            <div className="viz-section">
+              <h4>Initial truck loading (after depot, before driving)</h4>
+              <TruckLoadView
+                truck={run.data.truck}
+                cargo={run.data.initial_cargo}
+                clientNames={Object.fromEntries((run.data.stops || []).map((s) => [s.client_id, s.name]))}
+              />
+            </div>
+          )}
+
+          {run?.data?.stops?.some((s) => (s.stages || []).length > 0) && (
+            <div className="viz-section">
+              <h4>Per-stop unload timeline (each box is a stage)</h4>
+              <StopTimeline
+                stops={run.data.stops}
+                clientNames={Object.fromEntries((run.data.stops || []).map((s) => [s.client_id, s.name]))}
+              />
+            </div>
+          )}
+
+          {run?.data?.stops?.some((s) => (s.stages || []).length > 0) && run?.data?.truck && (
+            <div className="viz-section">
+              <h4>3D playback — step through every box that moves</h4>
+              <Playback3D run={run} />
             </div>
           )}
         </>

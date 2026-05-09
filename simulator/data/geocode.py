@@ -15,10 +15,14 @@ from simulator.config import DEPOT_LAT, DEPOT_LON
 
 _PREFIX_RADIUS_DEG = 0.55
 _SUFFIX_RADIUS_DEG = 0.04
+_CLIENT_JITTER_RADIUS_DEG = 0.012  # ~1.3 km — same neighborhood, distinct points
 
 
-def cp_to_coord(cp: str | None) -> tuple[float, float]:
+def cp_to_coord(cp: str | None, client_id: str | None = None) -> tuple[float, float]:
     if not cp:
+        if client_id:
+            jitter_lat, jitter_lon = _offset(client_id, _CLIENT_JITTER_RADIUS_DEG)
+            return DEPOT_LAT + jitter_lat, DEPOT_LON + jitter_lon
         return DEPOT_LAT, DEPOT_LON
     cp = str(cp).strip()
     if not cp:
@@ -28,7 +32,13 @@ def cp_to_coord(cp: str | None) -> tuple[float, float]:
 
     big_dlat, big_dlon = _offset(prefix, _PREFIX_RADIUS_DEG)
     small_dlat, small_dlon = _offset(suffix, _SUFFIX_RADIUS_DEG)
-    return DEPOT_LAT + big_dlat + small_dlat, DEPOT_LON + big_dlon + small_dlon
+    jitter_lat, jitter_lon = (0.0, 0.0)
+    if client_id:
+        jitter_lat, jitter_lon = _offset(client_id, _CLIENT_JITTER_RADIUS_DEG)
+    return (
+        DEPOT_LAT + big_dlat + small_dlat + jitter_lat,
+        DEPOT_LON + big_dlon + small_dlon + jitter_lon,
+    )
 
 
 def _offset(token: str, radius_deg: float) -> tuple[float, float]:

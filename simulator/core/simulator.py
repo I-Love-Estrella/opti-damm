@@ -63,10 +63,59 @@ class Simulator:
         state = WorldState.from_case(case)
         log = EventLog()
         log.emit(state.t_min, "SIM_START", algorithm=plan.algorithm, ruta=case.ruta, date=str(case.date))
+        cmds = list(plan.commands)
+        try:
+            i = 0
+            while i < len(cmds):
+                cmd = cmds[i]
+                if isinstance(cmd, (Unload, PickupReturn)) and state.current_client is not None:
+                    # Batch all consecutive Unload/PickupReturn for the same client.
+                    j = i
+                    unloads: list[Unload] = []
+                    pickups: list[PickupReturn] = []
+                    while j < len(cmds):
+                        c = cmds[j]
+                        if isinstance(c, Unload) and c.client_id == state.current_client:
+                            unloads.append(c)
+                            j += 1
+                            continue
+                        if isinstance(c, PickupReturn) and c.client_id == state.current_client:
+                            pickups.append(c)
+                            j += 1
+                            continue
+                        break
+                    if unloads:
+                        self._on_stop_batch(unloads, pickups, state, log)
+                    else:
+                        for p in pickups:
+                            self._on_pickup_return(p, state, log)
+                    i = j
+                    continue
+                self._dispatch(cmd, state, log)
+                i += 1
+            self._finalize(state, log, plan)
+            return SimulationResult(state=state, log=log, success=True)
+        except _CommandError as exc:
+            log.emit(state.t_min, "SIM_ERROR", message=str(exc))
+            return SimulationResult(state=state, log=log, success=False, error=str(exc))
+
+    def simulate_loading(self, case: DayCase, plan: Plan) -> SimulationResult:
+        """Run the plan only up to (and including) the first DepartDepot.
+
+        Returns a SimulationResult whose WorldState reflects the truck cargo
+        right after loading — before any driving. Useful for visualizing the
+        initial pallet layout independent of routing.
+        """
+        state = WorldState.from_case(case)
+        log = EventLog()
+        log.emit(state.t_min, "SIM_START", algorithm=plan.algorithm, ruta=case.ruta, date=str(case.date))
         try:
             for cmd in plan.commands:
+                if isinstance(cmd, DriveTo):
+                    break
                 self._dispatch(cmd, state, log)
-            self._finalize(state, log, plan)
+                if isinstance(cmd, DepartDepot):
+                    break
             return SimulationResult(state=state, log=log, success=True)
         except _CommandError as exc:
             log.emit(state.t_min, "SIM_ERROR", message=str(exc))
@@ -204,8 +253,62 @@ class Simulator:
         pallet = st.cargo.pallet_at(cmd.slot_id)
         if pallet is None:
             raise _CommandError(f"No pallet at slot {cmd.slot_id}")
-        moves = self._search_moves(pallet, cmd.client_id, cmd.sku)
+
+        target = None
+        for it in pallet.items:
+            if it.sku == cmd.sku and it.intended_client in (None, cmd.client_id):
+                target = it
+                break
+        if target is None:
+            st.drops.append((cmd.client_id, cmd.sku, cmd.qty))
+            log.emit(
+                st.t_min,
+                "DROP",
+                client_id=cmd.client_id,
+                sku=cmd.sku,
+                qty=cmd.qty,
+                slot_id=cmd.slot_id,
+                reason="target item not on pallet",
+            )
+            return
+
+        blockers = self._blockers_in_lift_order(pallet, target)
+        moves = sum(b.stack_size for b in blockers)
         st.search_moves += moves
+
+        per_box_lift = self._tm.service_min_per_search_move / 2.0
+        per_box_replace = self._tm.service_min_per_search_move / 2.0
+
+        # Phase 1: lift each blocker box-by-box. Top of each blocker stack
+        # comes off first (highest level → lowest level).
+        for b in blockers:
+            same_col = b.col_x == target.col_x and b.col_y == target.col_y
+            reason_text = (
+                "in target column above target" if same_col else "in stack closer to truck edge"
+            )
+            for unit in range(b.stack_size - 1, -1, -1):
+                level = b.bottom_level + unit
+                st.t_min += per_box_lift
+                log.emit(
+                    st.t_min,
+                    "BLOCKER_LIFT",
+                    client_id=cmd.client_id,
+                    slot_id=cmd.slot_id,
+                    target_sku=cmd.sku,
+                    target_client=cmd.client_id,
+                    sku=b.sku,
+                    qty=1,
+                    intended_client=b.intended_client,
+                    col_x=b.col_x,
+                    col_y=b.col_y,
+                    bottom_level=b.bottom_level,
+                    level=level,
+                    unit_idx=unit,
+                    total_units=b.stack_size,
+                    time_min=round(per_box_lift, 4),
+                    reason=reason_text,
+                )
+
         new_pallet, removed = pallet.remove_item(cmd.sku, cmd.qty, cmd.client_id)
         if removed is None:
             new_pallet, removed = pallet.remove_item(cmd.sku, cmd.qty, None)
@@ -217,15 +320,65 @@ class Simulator:
         st.delivered_qty[(cmd.client_id, cmd.sku)] = (
             st.delivered_qty.get((cmd.client_id, cmd.sku), 0.0) + actual_qty
         )
+
+        # Phase 2: take target box-by-box (top → bottom). Total time stays
+        # service_min_per_pallet, split across actual_qty units.
+        take_total_min = self._tm.service_min_per_pallet
+        target_units = max(1, int(round(actual_qty)))
+        per_unit_take = take_total_min / target_units
+        target_top = target.bottom_level + target.stack_size - 1
+        for u in range(target_units):
+            level = max(target.bottom_level, target_top - u)
+            st.t_min += per_unit_take
+            log.emit(
+                st.t_min,
+                "TARGET_TAKE",
+                client_id=cmd.client_id,
+                sku=cmd.sku,
+                qty=1,
+                slot_id=cmd.slot_id,
+                col_x=target.col_x,
+                col_y=target.col_y,
+                bottom_level=target.bottom_level,
+                level=level,
+                unit_idx=u,
+                total_units=target_units,
+                time_min=round(per_unit_take, 4),
+                reason="hand target box to client",
+            )
+
         if new_pallet.is_empty:
             st.cargo.pallet_by_id.pop(pallet.pallet_id, None)
             st.cargo.slot_by_pallet.pop(pallet.pallet_id, None)
             st.cargo.pallet_by_slot.pop(cmd.slot_id, None)
         else:
             st.cargo.pallet_by_id[pallet.pallet_id] = new_pallet
-        elapsed = self._tm.service_min_per_pallet
-        elapsed += moves * self._tm.service_min_per_search_move
-        st.t_min += elapsed
+
+        # Phase 3: replace blockers in reverse-of-lift LIFO order. Within each
+        # blocker, replay bottom → top (rebuild the original stack).
+        for b in reversed(blockers):
+            for unit in range(b.stack_size):
+                level = b.bottom_level + unit
+                st.t_min += per_box_replace
+                log.emit(
+                    st.t_min,
+                    "BLOCKER_REPLACE",
+                    client_id=cmd.client_id,
+                    slot_id=cmd.slot_id,
+                    target_sku=cmd.sku,
+                    sku=b.sku,
+                    qty=1,
+                    intended_client=b.intended_client,
+                    col_x=b.col_x,
+                    col_y=b.col_y,
+                    bottom_level=b.bottom_level,
+                    level=level,
+                    unit_idx=unit,
+                    total_units=b.stack_size,
+                    time_min=round(per_box_replace, 4),
+                    reason="restore stack after target taken",
+                )
+
         log.emit(
             st.t_min,
             "UNLOAD",
@@ -295,6 +448,328 @@ class Simulator:
         if not st.finalized:
             self._on_return_depot(st, log)
         log.emit(st.t_min, "SIM_END", algorithm=plan.algorithm, distance_km=st.distance_km)
+
+    def _on_stop_batch(
+        self,
+        unload_cmds: list[Unload],
+        pickup_cmds: list[PickupReturn],
+        st: WorldState,
+        log: EventLog,
+    ) -> None:
+        """Process all Unload + PickupReturn commands at one stop as a batch.
+
+        Optimization rules (matches a real driver's behavior):
+          1. For each slot, gather ALL targets at this stop, then compute the
+             combined set of items physically blocking any of them.
+          2. Items above-or-in-front whose intended_client == current client
+             are not blockers — they go to this client too. Lift them with
+             the target, then DELIVER them (no replace).
+          3. Items belonging to OTHER clients are foreign blockers — lift,
+             then replace AFTER all targets and same-client items are taken.
+          4. Each blocker is lifted at most once across the whole stop,
+             never re-lifted between deliveries to the same client.
+        """
+        if not unload_cmds:
+            for p in pickup_cmds:
+                self._on_pickup_return(p, st, log)
+            return
+
+        client_id = unload_cmds[0].client_id
+        if st.current_client != client_id:
+            raise _CommandError(
+                f"Unload at {client_id} but truck is at {st.current_client}"
+            )
+
+        by_slot: dict[str, list[Unload]] = {}
+        for cmd in unload_cmds:
+            by_slot.setdefault(cmd.slot_id, []).append(cmd)
+
+        for slot_id, slot_cmds in by_slot.items():
+            self._unload_slot_batch(slot_id, client_id, slot_cmds, st, log)
+
+        for p in pickup_cmds:
+            self._on_pickup_return(p, st, log)
+
+    def _unload_slot_batch(
+        self,
+        slot_id: str,
+        client_id: str,
+        cmds: list[Unload],
+        st: WorldState,
+        log: EventLog,
+    ) -> None:
+        pallet = st.cargo.pallet_at(slot_id)
+        if pallet is None:
+            for cmd in cmds:
+                st.drops.append((cmd.client_id, cmd.sku, cmd.qty))
+                log.emit(
+                    st.t_min,
+                    "DROP",
+                    client_id=cmd.client_id,
+                    sku=cmd.sku,
+                    qty=cmd.qty,
+                    slot_id=slot_id,
+                    reason="no pallet at slot",
+                )
+            return
+
+        targets: list[tuple[Unload, PalletItem]] = []
+        target_ids: set[int] = set()
+        for cmd in cmds:
+            picked: PalletItem | None = None
+            for it in pallet.items:
+                if id(it) in target_ids:
+                    continue
+                if it.sku == cmd.sku and it.intended_client in (None, client_id):
+                    picked = it
+                    target_ids.add(id(it))
+                    break
+            if picked is None:
+                st.drops.append((cmd.client_id, cmd.sku, cmd.qty))
+                log.emit(
+                    st.t_min,
+                    "DROP",
+                    client_id=cmd.client_id,
+                    sku=cmd.sku,
+                    qty=cmd.qty,
+                    slot_id=slot_id,
+                    reason="target item not on pallet",
+                )
+                continue
+            targets.append((cmd, picked))
+
+        if not targets:
+            return
+
+        foreign_blockers: list[PalletItem] = []
+        same_client_in_path: list[PalletItem] = []
+        foreign_seen: set[int] = set()
+        same_seen: set[int] = set()
+        reasons: dict[int, str] = {}
+
+        for _, target in targets:
+            for it in pallet.items:
+                if id(it) in target_ids:
+                    continue
+                same_col = it.col_x == target.col_x and it.col_y == target.col_y
+                is_above = same_col and it.bottom_level > target.top_level
+                is_edge = it.col_y < target.col_y
+                if not (is_above or is_edge):
+                    continue
+                it_id = id(it)
+                reasons.setdefault(
+                    it_id,
+                    "in target column above target" if is_above else "in stack closer to truck edge",
+                )
+                if it.intended_client == client_id:
+                    if it_id not in same_seen:
+                        same_seen.add(it_id)
+                        same_client_in_path.append(it)
+                else:
+                    if it_id not in foreign_seen:
+                        foreign_seen.add(it_id)
+                        foreign_blockers.append(it)
+
+        # Lift order: closer to edge first, then top-down within column.
+        lift_order = sorted(
+            foreign_blockers + same_client_in_path,
+            key=lambda b: (b.col_y, b.col_x, -b.bottom_level),
+        )
+
+        moves = sum(b.stack_size for b in lift_order)
+        st.search_moves += moves
+
+        per_box_lift = self._tm.service_min_per_search_move / 2.0
+        per_box_replace = self._tm.service_min_per_search_move / 2.0
+
+        # Phase 1: lift everything in the way (foreign + same-client).
+        for b in lift_order:
+            will_be_delivered = b.intended_client == client_id
+            for unit in range(b.stack_size - 1, -1, -1):
+                level = b.bottom_level + unit
+                st.t_min += per_box_lift
+                log.emit(
+                    st.t_min,
+                    "BLOCKER_LIFT",
+                    client_id=client_id,
+                    slot_id=slot_id,
+                    sku=b.sku,
+                    qty=1,
+                    intended_client=b.intended_client,
+                    col_x=b.col_x,
+                    col_y=b.col_y,
+                    bottom_level=b.bottom_level,
+                    level=level,
+                    unit_idx=unit,
+                    total_units=b.stack_size,
+                    time_min=round(per_box_lift, 4),
+                    reason=reasons.get(id(b), ""),
+                    will_be_delivered=will_be_delivered,
+                )
+
+        # Phase 2: take all targets (top-down, edge-first to keep physics tidy).
+        targets_sorted = sorted(targets, key=lambda ct: (ct[1].col_y, ct[1].col_x, -ct[1].bottom_level))
+        for cmd, target in targets_sorted:
+            self._take_item(
+                slot_id=slot_id,
+                client_id=client_id,
+                cmd_sku=cmd.sku,
+                cmd_qty=cmd.qty,
+                item_for_log=target,
+                reason="hand target box to client",
+                opportunistic=False,
+                st=st,
+                log=log,
+            )
+
+        # Phase 3: deliver same-client items that were lifted as path-clearing.
+        same_client_sorted = sorted(
+            same_client_in_path, key=lambda b: (b.col_y, b.col_x, -b.bottom_level)
+        )
+        for it in same_client_sorted:
+            self._take_item(
+                slot_id=slot_id,
+                client_id=client_id,
+                cmd_sku=it.sku,
+                cmd_qty=it.qty,
+                item_for_log=it,
+                reason="opportunistic delivery (was in lift path)",
+                opportunistic=True,
+                st=st,
+                log=log,
+            )
+
+        # Phase 4: replace ONLY foreign blockers, in reverse-of-lift LIFO order.
+        for b in reversed(foreign_blockers):
+            for unit in range(b.stack_size):
+                level = b.bottom_level + unit
+                st.t_min += per_box_replace
+                log.emit(
+                    st.t_min,
+                    "BLOCKER_REPLACE",
+                    client_id=client_id,
+                    slot_id=slot_id,
+                    sku=b.sku,
+                    qty=1,
+                    intended_client=b.intended_client,
+                    col_x=b.col_x,
+                    col_y=b.col_y,
+                    bottom_level=b.bottom_level,
+                    level=level,
+                    unit_idx=unit,
+                    total_units=b.stack_size,
+                    time_min=round(per_box_replace, 4),
+                    reason="restore stack after target taken",
+                )
+
+    def _take_item(
+        self,
+        *,
+        slot_id: str,
+        client_id: str,
+        cmd_sku: str,
+        cmd_qty: float,
+        item_for_log: PalletItem,
+        reason: str,
+        opportunistic: bool,
+        st: WorldState,
+        log: EventLog,
+    ) -> None:
+        """Remove item from pallet (or partial), emit per-box TARGET_TAKE + UNLOAD."""
+        current_pallet = st.cargo.pallet_at(slot_id)
+        if current_pallet is None:
+            st.drops.append((client_id, cmd_sku, cmd_qty))
+            log.emit(
+                st.t_min,
+                "DROP",
+                client_id=client_id,
+                sku=cmd_sku,
+                qty=cmd_qty,
+                slot_id=slot_id,
+                reason="pallet vanished mid-batch",
+            )
+            return
+
+        new_pallet, removed = current_pallet.remove_item(cmd_sku, cmd_qty, client_id)
+        if removed is None:
+            new_pallet, removed = current_pallet.remove_item(cmd_sku, cmd_qty, None)
+        if removed is None:
+            st.drops.append((client_id, cmd_sku, cmd_qty))
+            log.emit(
+                st.t_min,
+                "DROP",
+                client_id=client_id,
+                sku=cmd_sku,
+                qty=cmd_qty,
+                slot_id=slot_id,
+                reason="item already gone (took as same-client earlier)",
+            )
+            return
+
+        actual_qty = removed.qty
+        st.delivered_qty[(client_id, cmd_sku)] = (
+            st.delivered_qty.get((client_id, cmd_sku), 0.0) + actual_qty
+        )
+
+        target_units = max(1, int(round(actual_qty)))
+        per_unit_take = self._tm.service_min_per_pallet / target_units
+        target_top = item_for_log.bottom_level + item_for_log.stack_size - 1
+        for u in range(target_units):
+            level = max(item_for_log.bottom_level, target_top - u)
+            st.t_min += per_unit_take
+            log.emit(
+                st.t_min,
+                "TARGET_TAKE",
+                client_id=client_id,
+                sku=cmd_sku,
+                qty=1,
+                slot_id=slot_id,
+                col_x=item_for_log.col_x,
+                col_y=item_for_log.col_y,
+                bottom_level=item_for_log.bottom_level,
+                level=level,
+                unit_idx=u,
+                total_units=target_units,
+                time_min=round(per_unit_take, 4),
+                reason=reason,
+                opportunistic=opportunistic,
+            )
+
+        if new_pallet.is_empty:
+            st.cargo.pallet_by_id.pop(current_pallet.pallet_id, None)
+            st.cargo.slot_by_pallet.pop(current_pallet.pallet_id, None)
+            st.cargo.pallet_by_slot.pop(slot_id, None)
+        else:
+            st.cargo.pallet_by_id[current_pallet.pallet_id] = new_pallet
+
+        log.emit(
+            st.t_min,
+            "UNLOAD",
+            client_id=client_id,
+            sku=cmd_sku,
+            qty=actual_qty,
+            slot_id=slot_id,
+            search_moves=0,
+            opportunistic=opportunistic,
+        )
+
+    def _blockers_in_lift_order(self, pallet: Pallet, target: PalletItem) -> list[PalletItem]:
+        """Items that must be lifted off to reach `target`, sorted in the order
+        a driver would actually move them: closer-to-edge stacks first, then
+        top-down within each column.
+        """
+        out: list[PalletItem] = []
+        for it in pallet.items:
+            if it is target:
+                continue
+            same_col = it.col_x == target.col_x and it.col_y == target.col_y
+            if same_col and it.bottom_level > target.top_level:
+                out.append(it)
+                continue
+            if it.col_y < target.col_y:
+                out.append(it)
+        out.sort(key=lambda b: (b.col_y, b.col_x, -b.bottom_level))
+        return out
 
     def _search_moves(self, pallet: Pallet, client: str, sku: str) -> int:
         """Physical-access cost in number of physical units to lift off.

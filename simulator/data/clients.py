@@ -54,7 +54,7 @@ class Clients:
 
 
 def _placeholder(cid: str) -> ClientRecord:
-    lat, lon = cp_to_coord(None)
+    lat, lon = cp_to_coord(None, client_id=cid)
     return ClientRecord(
         client_id=cid,
         name=cid,
@@ -99,7 +99,7 @@ def _assemble(raw: RawData) -> dict[str, ClientRecord]:
         if not cid:
             continue
         cp = str(row.get("CP", "") or "").strip()
-        lat, lon = cp_to_coord(cp)
+        lat, lon = cp_to_coord(cp, client_id=cid)
         out[cid] = ClientRecord(
             client_id=cid,
             name=str(row.get("Nombre 1", "") or cid),

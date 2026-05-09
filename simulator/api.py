@@ -116,6 +116,86 @@ def _run_one(date: str, ruta: str, algo: str) -> dict:
         c.client_id for c in plan.commands if c.__class__.__name__ == "DriveTo"
     ]
 
+    stops = []
+    for seq, cid in enumerate(route, start=1):
+        rec = clients.get(cid)
+        stops.append(
+            {
+                "client_id": cid,
+                "name": rec.name,
+                "city": rec.city,
+                "cp": rec.cp,
+                "lat": rec.lat,
+                "lon": rec.lon,
+                "visit_seq": seq,
+            }
+        )
+
+    depot = {
+        "name": case.depot.name,
+        "lat": case.depot.lat,
+        "lon": case.depot.lon,
+    }
+
+    stops_trace = _build_stop_trace(result.log.to_records(), clients)
+
+    initial = sim.simulate_loading(case, plan)
+    cargo_state = initial.state.cargo
+    initial_cargo = []
+    for slot in cargo_state.slots:
+        pid = cargo_state.pallet_by_slot.get(slot.slot_id)
+        if pid is None:
+            initial_cargo.append({"slot_id": slot.slot_id, "side": slot.side, "pallet": None})
+            continue
+        pallet = cargo_state.pallet_by_id.get(pid)
+        if pallet is None:
+            initial_cargo.append({"slot_id": slot.slot_id, "side": slot.side, "pallet": None})
+            continue
+        layout = pallet.layout
+        items_payload = []
+        for it in pallet.items:
+            items_payload.append(
+                {
+                    "sku": it.sku,
+                    "qty": float(it.qty),
+                    "intended_client": it.intended_client,
+                    "is_returnable_empty": it.is_returnable_empty,
+                    "col_x": int(it.col_x),
+                    "col_y": int(it.col_y),
+                    "bottom_level": int(it.bottom_level),
+                    "stack_size": int(it.stack_size),
+                }
+            )
+        initial_cargo.append(
+            {
+                "slot_id": slot.slot_id,
+                "side": slot.side,
+                "pallet": {
+                    "pallet_id": pallet.pallet_id,
+                    "kind": pallet.kind.value if hasattr(pallet.kind, "value") else str(pallet.kind),
+                    "pallet_class": pallet.pallet_class.value if pallet.pallet_class else None,
+                    "primary_client": pallet.primary_client,
+                    "notes": pallet.notes,
+                    "layout": {
+                        "cols_x": layout.cols_x,
+                        "cols_y": layout.cols_y,
+                        "max_level": layout.max_level,
+                    },
+                    "volume_m3": float(pallet.volume_m3),
+                    "weight_kg": float(pallet.weight_kg),
+                    "items": items_payload,
+                },
+            }
+        )
+
+    for s in stops:
+        s["stages"] = stops_trace.get(s["client_id"], {}).get("stages", [])
+        s["arrive_t_min"] = stops_trace.get(s["client_id"], {}).get("arrive_t_min")
+        s["depart_t_min"] = stops_trace.get(s["client_id"], {}).get("depart_t_min")
+        s["dwell_min"] = stops_trace.get(s["client_id"], {}).get("dwell_min")
+
+    legs = _build_legs(stops, depot, result.log.to_records())
+
     return {
         "algorithm": algo,
         "date": str(case.date),
@@ -124,13 +204,198 @@ def _run_one(date: str, ruta: str, algo: str) -> dict:
             "code": case.truck.code,
             "pallet_capacity": case.truck.pallet_capacity,
             "max_weight_kg": case.truck.max_weight_kg,
+            "sides": list(case.truck.sides),
         },
+        "depot": depot,
+        "stops": stops,
+        "legs": legs,
         "n_clients": case.n_clients,
         "rationale": list(plan.rationale),
         "route": route,
         "pallets_planned": pallet_count,
+        "initial_cargo": initial_cargo,
         "kpis": kpi.to_dict(),
     }
+
+
+def _build_legs(stops: list[dict], depot: dict, records: list[dict]) -> list[dict]:
+    """Per-segment (from → to) info: distance, drive time, leg index."""
+    legs: list[dict] = []
+    arrive_by_client: dict[str, dict] = {}
+    return_record: dict | None = None
+    for r in records:
+        if r.get("kind") == "ARRIVE":
+            cid = r.get("client_id")
+            if cid:
+                arrive_by_client.setdefault(cid, r)
+        elif r.get("kind") == "RETURN_DEPOT":
+            return_record = r
+
+    prev_lat = depot["lat"]
+    prev_lon = depot["lon"]
+    prev_name = depot["name"]
+    prev_id = "DEPOT"
+
+    for idx, s in enumerate(stops, start=1):
+        ar = arrive_by_client.get(s["client_id"]) or {}
+        legs.append(
+            {
+                "leg_index": idx,
+                "from_id": prev_id,
+                "from_name": prev_name,
+                "from_lat": prev_lat,
+                "from_lon": prev_lon,
+                "to_id": s["client_id"],
+                "to_name": s["name"],
+                "to_lat": s["lat"],
+                "to_lon": s["lon"],
+                "to_visit_seq": s["visit_seq"],
+                "distance_km": float(ar.get("distance_km", 0.0) or 0.0),
+                "drive_min": float(ar.get("drive_min", 0.0) or 0.0),
+                "arrive_t_min": s.get("arrive_t_min"),
+            }
+        )
+        prev_lat = s["lat"]
+        prev_lon = s["lon"]
+        prev_name = s["name"]
+        prev_id = s["client_id"]
+
+    if return_record is not None:
+        legs.append(
+            {
+                "leg_index": len(legs) + 1,
+                "from_id": prev_id,
+                "from_name": prev_name,
+                "from_lat": prev_lat,
+                "from_lon": prev_lon,
+                "to_id": "DEPOT",
+                "to_name": depot["name"],
+                "to_lat": depot["lat"],
+                "to_lon": depot["lon"],
+                "to_visit_seq": None,
+                "distance_km": float(return_record.get("distance_km", 0.0) or 0.0),
+                "drive_min": float(return_record.get("drive_min", 0.0) or 0.0),
+                "arrive_t_min": float(return_record.get("t_min", 0.0) or 0.0),
+            }
+        )
+    return legs
+
+
+_PER_STOP_KINDS = {
+    "ARRIVE",
+    "SERVICE_BASE",
+    "BLOCKER_LIFT",
+    "TARGET_TAKE",
+    "BLOCKER_REPLACE",
+    "UNLOAD",
+    "DROP",
+    "PICKUP_RETURN",
+}
+
+
+def _stage_description(rec: dict) -> str:
+    kind = rec["kind"]
+    if kind == "ARRIVE":
+        return f"Arrive at {rec.get('client_name') or rec.get('client_id') or 'client'} (drove {rec.get('distance_km', 0):.1f} km)"
+    if kind == "SERVICE_BASE":
+        return "Park, paperwork, open doors"
+    if kind == "BLOCKER_LIFT":
+        sku = rec.get("sku")
+        whose = rec.get("intended_client") or "—"
+        col = f"col ({rec.get('col_x')},{rec.get('col_y')})"
+        level = rec.get("level")
+        unit = rec.get("unit_idx")
+        total = rec.get("total_units")
+        unit_tag = f" [{int(unit) + 1}/{int(total)}]" if unit is not None and total else ""
+        return f"Lift 1 box {sku}{unit_tag} from {col} lvl {level} (for client {whose}) — {rec.get('reason')}"
+    if kind == "TARGET_TAKE":
+        sku = rec.get("sku")
+        col = f"col ({rec.get('col_x')},{rec.get('col_y')})"
+        level = rec.get("level")
+        unit = rec.get("unit_idx")
+        total = rec.get("total_units")
+        unit_tag = f" [{int(unit) + 1}/{int(total)}]" if unit is not None and total else ""
+        return f"Take 1 box {sku}{unit_tag} from {col} lvl {level} → hand to client"
+    if kind == "BLOCKER_REPLACE":
+        sku = rec.get("sku")
+        col = f"col ({rec.get('col_x')},{rec.get('col_y')})"
+        level = rec.get("level")
+        unit = rec.get("unit_idx")
+        total = rec.get("total_units")
+        unit_tag = f" [{int(unit) + 1}/{int(total)}]" if unit is not None and total else ""
+        return f"Put 1 box {sku}{unit_tag} back into {col} lvl {level}"
+    if kind == "UNLOAD":
+        return f"Delivery line complete — {rec.get('sku')} ×{rec.get('qty', 0):g} ({rec.get('search_moves', 0)} search-moves)"
+    if kind == "DROP":
+        return f"DROP — {rec.get('sku')} ×{rec.get('qty', 0):g} could not be delivered"
+    if kind == "PICKUP_RETURN":
+        return f"Pick up empties — {rec.get('sku')} ×{rec.get('qty', 0):g}"
+    return kind
+
+
+def _build_stop_trace(records: list[dict], clients: Clients) -> dict[str, dict]:
+    """Group event-log records into per-client stop traces.
+
+    Returns: { client_id → { arrive_t_min, depart_t_min, dwell_min, stages: [...] } }
+    """
+    out: dict[str, dict] = {}
+    current: dict | None = None
+    prev_t: float | None = None
+
+    for r in records:
+        kind = r.get("kind")
+        t = float(r.get("t_min") or 0.0)
+
+        if kind == "ARRIVE":
+            cid = r.get("client_id")
+            if not cid:
+                continue
+            current = out.setdefault(
+                cid,
+                {
+                    "client_id": cid,
+                    "arrive_t_min": t,
+                    "depart_t_min": t,
+                    "dwell_min": 0.0,
+                    "stages": [],
+                },
+            )
+            current["arrive_t_min"] = t
+            prev_t = t
+            current["stages"].append(
+                {
+                    "seq": int(r.get("seq", 0)),
+                    "kind": kind,
+                    "t_min": round(t, 3),
+                    "time_min": 0.0,
+                    "description": _stage_description(r),
+                    "detail": {k: v for k, v in r.items() if k not in {"seq", "t_min", "kind"}},
+                }
+            )
+            continue
+
+        if current is None:
+            continue
+
+        if kind in _PER_STOP_KINDS:
+            time_min = float(r.get("time_min") or 0.0)
+            if time_min == 0.0 and prev_t is not None:
+                time_min = max(0.0, t - prev_t)
+            current["stages"].append(
+                {
+                    "seq": int(r.get("seq", 0)),
+                    "kind": kind,
+                    "t_min": round(t, 3),
+                    "time_min": round(time_min, 3),
+                    "description": _stage_description(r),
+                    "detail": {k: v for k, v in r.items() if k not in {"seq", "t_min", "kind"}},
+                }
+            )
+            current["depart_t_min"] = t
+            current["dwell_min"] = round(t - current["arrive_t_min"], 3)
+            prev_t = t
+
+    return out
 
 
 def _bench(algos: list[str], max_cases: int, seed: int, min_clients: int) -> dict:

@@ -610,7 +610,12 @@ export default function Page() {
       </main>
 
       <Section id="metrics" collapsed={collapsed.has('metrics')} fullscreen={fullscreenPanel === 'metrics'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen} dark>
-        <MetricsBar kpis={kpis} fullscreen={fullscreenPanel === 'metrics'} />
+        <MetricsBar
+          kpis={kpis}
+          fullscreen={fullscreenPanel === 'metrics'}
+          routeDetail={routeDetail}
+          simStops={stops}
+        />
       </Section>
 
       <footer className="footer">

@@ -1913,6 +1913,88 @@ button {
   margin-left: 3px;
   opacity: 0.6;
 }
+
+/* ───── plan-vs-simulator comparison ───── */
+.cmp-block {
+  grid-column: 1 / -1;
+  border: 1px solid rgba(244, 239, 227, 0.12);
+  padding: 14px 18px;
+  background: rgba(244, 239, 227, 0.03);
+}
+.cmp-table {
+  display: flex;
+  flex-direction: column;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.cmp-row {
+  display: grid;
+  grid-template-columns: 2fr 1.4fr 1.4fr 0.8fr;
+  gap: 12px;
+  padding: 6px 4px;
+  align-items: baseline;
+  border-bottom: 1px solid rgba(244, 239, 227, 0.06);
+}
+.cmp-row:last-child { border-bottom: none; }
+.cmp-row.cmp-head {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.5;
+  border-bottom: 1px solid rgba(244, 239, 227, 0.18);
+  padding-bottom: 8px;
+}
+.cmp-label { opacity: 0.85; }
+.cmp-org, .cmp-sim, .cmp-delta { text-align: right; }
+.cmp-unit { opacity: 0.5; font-size: 10px; }
+.cmp-delta { font-variant-numeric: tabular-nums; }
+.cmp-delta-pos { color: #f4a261; }
+.cmp-delta-neg { color: #7fc8a9; }
+.cmp-delta-zero { opacity: 0.5; }
+
+/* Compact strip below the 6 KPI tiles */
+.cmp-strip {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(244, 239, 227, 0.12);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 22px;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.cmp-strip-label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+.cmp-strip-cell {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.cmp-strip-key {
+  opacity: 0.55;
+}
+.cmp-strip-vals {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-variant-numeric: tabular-nums;
+}
+.cmp-strip-arrow { opacity: 0.4; }
+.cmp-strip-delta {
+  font-size: 10px;
+  padding: 1px 5px;
+  border: 1px solid rgba(244, 239, 227, 0.15);
+  border-radius: 3px;
+  opacity: 0.85;
+}
+.cmp-strip-delta.cmp-delta-pos { color: #f4a261; border-color: rgba(244, 162, 97, 0.3); }
+.cmp-strip-delta.cmp-delta-neg { color: #7fc8a9; border-color: rgba(127, 200, 169, 0.3); }
+.cmp-strip-delta.cmp-delta-zero { opacity: 0.4; }
 .section-fullscreen .slider-label {
   font-size: 22px;
 }

@@ -22,6 +22,8 @@ def _allowed_origins() -> list[str]:
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
+        "https://optidamm.ink",
+        "https://www.optidamm.ink",
     ]
 
 

@@ -12,6 +12,7 @@ from simulator.domain.plan import Plan
 
 class Algorithm(ABC):
     name: str = "abstract"
+    description: str = ""
 
     @abstractmethod
     def plan(self, case: DayCase, clients: Clients, network: Network) -> Plan:

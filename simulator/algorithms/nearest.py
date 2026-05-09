@@ -40,6 +40,10 @@ class _ClientGroup:
 
 class NearestNeighborSmart(Algorithm):
     name = "nearest"
+    description = (
+        "Greedy nearest-neighbor route + 2-opt; one CLIENT_BLOCK pallet per "
+        "(client, class). Last visit goes to the back-most slot."
+    )
 
     def plan(self, case: DayCase, clients: Clients, network: Network) -> Plan:
         rationale = ["Route: nearest-neighbor + 2-opt. Loading: client-block in reverse visit order."]

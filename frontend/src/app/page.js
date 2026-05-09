@@ -51,6 +51,7 @@ export default function LandingPage() {
           <a href="#faq">FAQ</a>
         </div>
         <div className="nav-cta">
+          <Link href="/algorithms" className="btn ghost">Algorithms ↗</Link>
           <Link href="/console" className="btn ghost">Open console ↗</Link>
           <a href="#final" className="btn solid">Request a pilot</a>
         </div>

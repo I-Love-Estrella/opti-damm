@@ -41,6 +41,10 @@ class _OpenPallet:
 
 class ReplayBaseline(Algorithm):
     name = "replay"
+    description = (
+        "Baseline mimicking current Damm practice: visit clients in the actual "
+        "delivery-note order, pack pallets by SKU (FFD), keg/box-aware."
+    )
 
     def plan(self, case: DayCase, clients: Clients, network: Network) -> Plan:
         cmds: list[Command] = []

@@ -18,6 +18,12 @@
 //     currentStage, pendingStage, idx, total,
 //   }
 
+// Legacy cell sizes used by Python's PalletItem.col_x/col_y/bottom_level
+// derivation. Kept in sync with simulator/domain/pallet.py.
+const _LEGACY_CELL_X_M = 0.30;
+const _LEGACY_CELL_Y_M = 0.27;
+const _LEGACY_CELL_H_M = 0.30;
+
 function boxKey(slotId, colX, colY, level, sku, intendedClient) {
   return `${slotId}|${colX}|${colY}|${level}|${sku}|${intendedClient ?? ''}`;
 }
@@ -28,7 +34,41 @@ function pickEventLevel(detail) {
   return null;
 }
 
-function findBox(boxes, slotId, colX, colY, level, sku, intendedClient, status) {
+function findBox(boxes, slotId, colX, colY, level, sku, intendedClient, status, posX, posY, posZ) {
+  // Prefer continuous-pos matching when the simulator gave us pos_*.
+  // Several small items can share the same legacy (col_x, col_y, level)
+  // cell, so col-based matching mis-targets and the next event finds
+  // the wrong physical box (the visible "overlap" comes from this).
+  if (posX !== undefined && posX !== null) {
+    const eps = 0.005;
+    for (const b of boxes) {
+      if (
+        b.status === status &&
+        b.slot_id === slotId &&
+        b.sku === sku &&
+        Math.abs((b.pos_x ?? 0) - posX) < eps &&
+        Math.abs((b.pos_y ?? 0) - posY) < eps &&
+        Math.abs((b.pos_z ?? 0) - posZ) < eps &&
+        (intendedClient === undefined || intendedClient === null || b.intended_client === intendedClient)
+      ) {
+        return b;
+      }
+    }
+    // Fallback: ignore intended_client.
+    for (const b of boxes) {
+      if (
+        b.status === status &&
+        b.slot_id === slotId &&
+        b.sku === sku &&
+        Math.abs((b.pos_x ?? 0) - posX) < eps &&
+        Math.abs((b.pos_y ?? 0) - posY) < eps &&
+        Math.abs((b.pos_z ?? 0) - posZ) < eps
+      ) {
+        return b;
+      }
+    }
+  }
+  // Legacy col-based matching (kept for events that don't carry pos_*).
   for (const b of boxes) {
     if (
       b.status === status &&
@@ -192,22 +232,88 @@ export function cargoStateAt(initialCargo, stages, idx) {
     const lvl = pickEventLevel(d);
 
     if (stg.kind === 'BLOCKER_LIFT') {
-      const box = findBox(boxes, d.slot_id, d.col_x, d.col_y, lvl, d.sku, d.intended_client, 'in_pallet');
+      const box = findBox(boxes, d.slot_id, d.col_x, d.col_y, lvl, d.sku, d.intended_client, 'in_pallet', d.pos_x, d.pos_y, d.pos_z);
       if (box) {
         box.status = 'in_hands';
         box.history.push({ step_idx: i, kind: 'lifted', t_min: stg.t_min, time_min: stg.time_min });
       }
     } else if (stg.kind === 'BLOCKER_REPLACE') {
-      const box = findBox(boxes, d.slot_id, d.col_x, d.col_y, lvl, d.sku, d.intended_client, 'in_hands');
+      // Match by ORIGINAL pos using `from_pos_*` from the event.
+      // `box.pos_*` still holds the lift-time location after BLOCKER_LIFT.
+      // Without from_pos matching, two blockers sharing (sku, client)
+      // would get their destinations swapped, producing visible overlap.
+      let box = null;
+      const fromX = d.from_pos_x;
+      const fromY = d.from_pos_y;
+      const fromZ = d.from_pos_z;
+      if (fromX !== undefined && fromX !== null) {
+        const eps = 0.005;
+        for (const b of boxes) {
+          if (
+            b.status === 'in_hands' &&
+            b.slot_id === d.slot_id &&
+            b.sku === d.sku &&
+            Math.abs((b.pos_x ?? 0) - fromX) < eps &&
+            Math.abs((b.pos_y ?? 0) - fromY) < eps &&
+            Math.abs((b.pos_z ?? 0) - fromZ) < eps &&
+            (d.intended_client === undefined || d.intended_client === null || b.intended_client === d.intended_client)
+          ) {
+            box = b;
+            break;
+          }
+        }
+      }
+      if (!box) {
+        // Fallback when from_pos isn't carried (legacy events): pick
+        // the first matching in_hands box. Order-dependent, may
+        // mis-pair when multiple blockers share (sku, client).
+        for (const b of boxes) {
+          if (
+            b.status === 'in_hands' &&
+            b.slot_id === d.slot_id &&
+            b.sku === d.sku &&
+            (d.intended_client === undefined || d.intended_client === null || b.intended_client === d.intended_client)
+          ) {
+            box = b;
+            break;
+          }
+        }
+      }
+      if (!box) {
+        // Legacy column-based fallback.
+        box = findBox(boxes, d.slot_id, d.col_x, d.col_y, lvl, d.sku, d.intended_client, 'in_hands');
+      }
       if (box) {
         box.status = 'in_pallet';
+        // The simulator carries the algorithm's restock pos in the
+        // BLOCKER_REPLACE event — update the box so it lands at its
+        // new spot. Without this it stays at the legacy lift coords
+        // and visually keeps floating.
+        if (d.pos_x !== undefined && d.pos_x !== null) box.pos_x = d.pos_x;
+        if (d.pos_y !== undefined && d.pos_y !== null) box.pos_y = d.pos_y;
+        if (d.pos_z !== undefined && d.pos_z !== null) box.pos_z = d.pos_z;
+        if (d.dim_x !== undefined && d.dim_x !== null) box.dim_x = d.dim_x;
+        if (d.dim_y !== undefined && d.dim_y !== null) box.dim_y = d.dim_y;
+        if (d.dim_h !== undefined && d.dim_h !== null) box.dim_h = d.dim_h;
+        // Recompute legacy discrete coords from the new pos so the
+        // NEXT lift / take / replace event finds this box (events
+        // carry recalculated col_x/col_y/level matching the new pos).
+        if (box.pos_x !== undefined) {
+          box.col_x = Math.max(0, Math.floor(box.pos_x / _LEGACY_CELL_X_M));
+        }
+        if (box.pos_y !== undefined) {
+          box.col_y = Math.max(0, Math.floor(box.pos_y / _LEGACY_CELL_Y_M));
+        }
+        if (box.pos_z !== undefined) {
+          box.level = Math.max(0, Math.floor(box.pos_z / _LEGACY_CELL_H_M));
+        }
         box.history.push({ step_idx: i, kind: 'replaced', t_min: stg.t_min, time_min: stg.time_min });
       }
     } else if (stg.kind === 'TARGET_TAKE') {
       // Try in_pallet first (regular target), fall back to in_hands (opportunistic same-client delivery)
-      let box = findBox(boxes, d.slot_id, d.col_x, d.col_y, lvl, d.sku, undefined, 'in_pallet');
+      let box = findBox(boxes, d.slot_id, d.col_x, d.col_y, lvl, d.sku, undefined, 'in_pallet', d.pos_x, d.pos_y, d.pos_z);
       if (!box) {
-        box = findBox(boxes, d.slot_id, d.col_x, d.col_y, lvl, d.sku, undefined, 'in_hands');
+        box = findBox(boxes, d.slot_id, d.col_x, d.col_y, lvl, d.sku, undefined, 'in_hands', d.pos_x, d.pos_y, d.pos_z);
       }
       if (box) {
         box.status = 'delivered';
@@ -218,10 +324,58 @@ export function cargoStateAt(initialCargo, stages, idx) {
           time_min: stg.time_min,
         });
       }
+    } else if (stg.kind === 'SETTLE') {
+      // The simulator detected a box left floating after a delivery
+      // removed its supporter and dropped it to a clean anchor. Find
+      // the stale box (still at from_pos) and update its position.
+      // Without this the visualizer keeps rendering the keg at its
+      // pre-settle pos — visible as "100% intersection" with whatever
+      // is now at that anchor.
+      const fromX = d.from_pos_x;
+      const fromY = d.from_pos_y;
+      const fromZ = d.from_pos_z;
+      let box = null;
+      const eps = 0.005;
+      for (const b of boxes) {
+        if (
+          b.status === 'in_pallet' &&
+          b.slot_id === d.slot_id &&
+          b.sku === d.sku &&
+          Math.abs((b.pos_x ?? 0) - fromX) < eps &&
+          Math.abs((b.pos_y ?? 0) - fromY) < eps &&
+          Math.abs((b.pos_z ?? 0) - fromZ) < eps
+        ) {
+          box = b;
+          break;
+        }
+      }
+      if (box) {
+        if (d.pos_x !== undefined) box.pos_x = d.pos_x;
+        if (d.pos_y !== undefined) box.pos_y = d.pos_y;
+        if (d.pos_z !== undefined) box.pos_z = d.pos_z;
+        if (d.dim_x !== undefined) box.dim_x = d.dim_x;
+        if (d.dim_y !== undefined) box.dim_y = d.dim_y;
+        if (d.dim_h !== undefined) box.dim_h = d.dim_h;
+        // Recompute legacy discrete coords so future events match.
+        box.col_x = Math.max(0, Math.floor((box.pos_x ?? 0) / _LEGACY_CELL_X_M));
+        box.col_y = Math.max(0, Math.floor((box.pos_y ?? 0) / _LEGACY_CELL_Y_M));
+        box.level = Math.max(0, Math.floor((box.pos_z ?? 0) / _LEGACY_CELL_H_M));
+        box.history.push({ step_idx: i, kind: 'settled', t_min: stg.t_min, time_min: stg.time_min });
+      }
     } else if (stg.kind === 'PICKUP_RETURN') {
       const slotMeta = palletsBySlot[d.slot_id];
       if (slotMeta) {
         const qty = Math.max(1, Math.ceil(d.qty || 1));
+        // The algorithm sends exact placement (pos_*, dim_*) for the
+        // whole stack. Render it as `qty` cubes piled vertically at
+        // that anchor instead of dropping all of them at (0,0,0).
+        const stackPosX = d.pos_x ?? 0;
+        const stackPosY = d.pos_y ?? 0;
+        const stackPosZ = d.pos_z ?? 0;
+        const stackDimX = d.dim_x ?? 0.40;
+        const stackDimY = d.dim_y ?? 0.40;
+        const stackDimH = d.dim_h ?? qty * 0.65;
+        const sliceH = qty > 0 ? stackDimH / qty : stackDimH;
         for (let k = 0; k < qty; k++) {
           boxes.push({
             id: `b${nextId++}`,
@@ -232,6 +386,14 @@ export function cargoStateAt(initialCargo, stages, idx) {
             col_x: 0,
             col_y: 0,
             level: k,
+            // Continuous coords from the algorithm — k-th keg sits
+            // (k * sliceH) above the stack base.
+            pos_x: stackPosX,
+            pos_y: stackPosY,
+            pos_z: stackPosZ + k * sliceH,
+            dim_x: stackDimX,
+            dim_y: stackDimY,
+            dim_h: sliceH,
             sku: d.sku || 'EMPTY',
             qty: 1,
             intended_client: null,

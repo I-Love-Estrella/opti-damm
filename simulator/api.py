@@ -111,18 +111,24 @@ def _list_days(min_clients: int, head: int) -> dict:
     return {"total": int(len(df)), "items": items}
 
 
-def _run_one(date: str, ruta: str, algo: str) -> dict:
+def _run_one(date: str, ruta: str, algo: str, strict_physics: bool = False) -> dict:
     ctx = _ctx()
     builder: DayCaseBuilder = ctx["builder"]  # type: ignore
     clients: Clients = ctx["clients"]  # type: ignore
     network: Network = ctx["network"]  # type: ignore
-    sim: Simulator = ctx["sim"]  # type: ignore
+    sim_default: Simulator = ctx["sim"]  # type: ignore
 
     fecha = dt.date.fromisoformat(date)
     case = builder.build(fecha, ruta)
     if algo not in REGISTRY:
         raise ValueError(f"Unknown algorithm: {algo}")
     plan = get(algo).plan(case, clients, network)
+    # Strict mode requires its own simulator (immutable strict flag).
+    sim = (
+        Simulator(clients=clients, network=network, strict_physics=True)
+        if strict_physics
+        else sim_default
+    )
     result = sim.run(case, plan)
     kpi = compute(result)
     validation = validate_plan(case, plan, result, sim)
@@ -221,6 +227,41 @@ def _run_one(date: str, ruta: str, algo: str) -> dict:
 
     legs = _build_legs(stops, depot, result.log.to_records())
 
+    # Deduplicate physics violations: same overlap re-emits on every
+    # subsequent state change. Key by (code, slot, sku_a, sku_b, pos
+    # rounded to MILLIMETRE) so visually-distinct overlaps stay
+    # separate, but the same overlap re-emitting after each next
+    # command is collapsed.
+    physics_violations = []
+    seen_violations: set[tuple] = set()
+    for r in result.log.to_records():
+        if r.get("kind") != "PHYSICS_VIOLATION":
+            continue
+        pos_a = r.get("pos") or r.get("pos_a") or [0, 0, 0]
+        pos_b = r.get("pos_b") or [0, 0, 0]
+        key = (
+            r.get("code"),
+            r.get("slot_id"),
+            r.get("sku") or r.get("sku_a"),
+            r.get("sku_b"),
+            tuple(round(float(x), 3) for x in pos_a),
+            tuple(round(float(x), 3) for x in pos_b),
+        )
+        if key in seen_violations:
+            continue
+        seen_violations.add(key)
+        physics_violations.append(
+            {
+                "seq": int(r.get("seq", 0)),
+                "t_min": float(r.get("t_min", 0.0) or 0.0),
+                "code": r.get("code"),
+                "message": r.get("message"),
+                "where": r.get("where"),
+                "slot_id": r.get("slot_id"),
+                "sku": r.get("sku") or r.get("sku_a"),
+            }
+        )
+
     return {
         "algorithm": algo,
         "date": str(case.date),
@@ -241,6 +282,7 @@ def _run_one(date: str, ruta: str, algo: str) -> dict:
         "initial_cargo": initial_cargo,
         "kpis": kpi.to_dict(),
         "validation": validation.to_dict(),
+        "physics_violations": physics_violations,
     }
 
 
@@ -316,6 +358,11 @@ _PER_STOP_KINDS = {
     "UNLOAD",
     "DROP",
     "PICKUP_RETURN",
+    # SETTLE moves a previously-placed box that just lost its
+    # supporter. The frontend reads it to update the box's pos so the
+    # visualizer never shows a keg floating or "100% inside another
+    # keg" at its stale pre-settle location.
+    "SETTLE",
 }
 
 
@@ -373,6 +420,12 @@ def _stage_description(rec: dict) -> str:
         return f"DROP — {rec.get('sku')} ×{rec.get('qty', 0):g} could not be delivered"
     if kind == "PICKUP_RETURN":
         return f"Pick up empties — {rec.get('sku')} ×{rec.get('qty', 0):g}"
+    if kind == "SETTLE":
+        return (
+            f"Settle floating {rec.get('sku')} from "
+            f"({rec.get('from_pos_x', 0):.2f},{rec.get('from_pos_y', 0):.2f},{rec.get('from_pos_z', 0):.2f}) "
+            f"to ({rec.get('pos_x', 0):.2f},{rec.get('pos_y', 0):.2f},{rec.get('pos_z', 0):.2f})"
+        )
     return kind
 
 
@@ -530,10 +583,11 @@ class Handler(BaseHTTPRequestHandler):
                 date = str(body.get("date") or "")
                 ruta = str(body.get("ruta") or "")
                 algo = str(body.get("algo") or "")
+                strict = bool(body.get("strict_physics") or False)
                 if not (date and ruta and algo):
                     self._json(400, {"error": "missing date/ruta/algo"})
                     return
-                self._json(200, _run_one(date, ruta, algo))
+                self._json(200, _run_one(date, ruta, algo, strict_physics=strict))
                 return
             if url.path == "/api/bench":
                 algos = body.get("algos") or list(REGISTRY.keys())

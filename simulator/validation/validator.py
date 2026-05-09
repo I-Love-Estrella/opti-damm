@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -49,6 +50,22 @@ LR_IMBALANCE_RATIO = 1.5
 FILL_RATE_ERROR = 0.95
 OVERTIME_HARD_HOURS = 13.0
 OVERTIME_WARN_HOURS = 10.0
+
+# Stack stability — narrow towers tip over. A stack is unstable when its
+# height exceeds STACK_RATIO_ERROR × the smaller footprint side. Below
+# the WARN threshold we still flag a soft warning so the operator knows
+# the stack is getting wobbly.
+STACK_RATIO_ERROR = 3.5
+STACK_RATIO_WARN = 3.0
+# Anything physically smaller than this on the long side gets a hard pass —
+# tiny single items (a lone bottle, a single can) shouldn't trip a stack
+# rule because they aren't really a "stack".
+STACK_MIN_HEIGHT_M = 0.40
+
+# Overlap tolerance — must match the simulator's _PHYSICS_EPS so the
+# validator agrees with runtime checks. 0.1 mm — strict enough to catch
+# any real overlap, loose enough to ignore floating-point noise.
+OVERLAP_EPS_M = 1e-4
 
 
 class ValidationSeverity(str, Enum):
@@ -115,13 +132,26 @@ def validate_plan(
 ) -> ValidationReport:
     issues: list[ValidationIssue] = []
 
+    # Runtime physics violations: any overlap / out-of-bounds / floating
+    # event the simulator raised during the run is surfaced as a hard
+    # ERROR. We do this BEFORE any other check so a broken plan can't
+    # be mistaken for a clean one.
+    issues.extend(_check_runtime_physics(result))
+
     # Process-level checks: read directly from final WorldState.
     issues.extend(_check_process(case, plan, result))
+
+    # Final-state cargo checks (overlap on every loaded pallet — runs
+    # against the final post-route state too, not just the post-load
+    # state, so any restock or returnable that ended up overlapping is
+    # caught even if the simulator's per-command check was skipped).
+    issues.extend(_check_overlaps(result.state, where="final state"))
 
     # Cargo physical checks: re-run loading to capture the exact post-depot state.
     try:
         loading = sim.simulate_loading(case, plan)
         if loading.success:
+            issues.extend(_check_overlaps(loading.state, where="post-load"))
             issues.extend(_check_cargo(case, loading.state))
     except Exception as exc:  # defensive — never let validation crash a run
         issues.append(
@@ -316,6 +346,171 @@ def _check_process(case: DayCase, plan: Plan, result: SimulationResult) -> list[
             )
         )
 
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Physics — overlap & runtime violations (hard errors)
+# ---------------------------------------------------------------------------
+
+
+def _print_error(msg: str) -> None:
+    """Always print every physics ERROR to stderr so an operator sees
+    the failure even when the JSON response is ignored."""
+    print(f"[CHECKER] {msg}", file=sys.stderr)
+
+
+def _aabb_overlap_volume(a: PalletItem, b: PalletItem) -> float:
+    """Volume of the 3D AABB intersection. 0 means no overlap."""
+    ox = max(0.0, min(a.end_x, b.end_x) - max(a.pos_x, b.pos_x))
+    oy = max(0.0, min(a.end_y, b.end_y) - max(a.pos_y, b.pos_y))
+    oz = max(0.0, min(a.top_z, b.top_z) - max(a.pos_z, b.pos_z))
+    return ox * oy * oz
+
+
+def _check_overlaps(state: WorldState, where: str) -> list[ValidationIssue]:
+    """Walk every loaded pallet and emit one OVERLAP error per colliding
+    pair. Tolerance matches the simulator's physics epsilon so we agree
+    with runtime checks. Always severity=ERROR — any overlap is a bug
+    in the algorithm. Each overlap is also printed to stderr."""
+    out: list[ValidationIssue] = []
+    seen_pairs: set[tuple] = set()
+    for pallet_id, slot_id in state.cargo.slot_by_pallet.items():
+        pallet = state.cargo.pallet_by_id.get(pallet_id)
+        if pallet is None:
+            continue
+        items = [it for it in pallet.items if it.qty > 0]
+        for i, a in enumerate(items):
+            for b in items[i + 1:]:
+                # Same logic as core/simulator._check_pallet_invariants.
+                if not (
+                    a.pos_x < b.end_x - OVERLAP_EPS_M
+                    and b.pos_x < a.end_x - OVERLAP_EPS_M
+                    and a.pos_y < b.end_y - OVERLAP_EPS_M
+                    and b.pos_y < a.end_y - OVERLAP_EPS_M
+                    and a.pos_z < b.top_z - OVERLAP_EPS_M
+                    and b.pos_z < a.top_z - OVERLAP_EPS_M
+                ):
+                    continue
+                vol = _aabb_overlap_volume(a, b)
+                a_vol = a.dim_x * a.dim_y * a.dim_h
+                b_vol = b.dim_x * b.dim_y * b.dim_h
+                ratio = vol / max(min(a_vol, b_vol), 1e-9)
+                key = (
+                    slot_id,
+                    a.sku,
+                    b.sku,
+                    round(a.pos_x, 3),
+                    round(a.pos_y, 3),
+                    round(a.pos_z, 3),
+                    round(b.pos_x, 3),
+                    round(b.pos_y, 3),
+                    round(b.pos_z, 3),
+                )
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                msg = (
+                    f"Overlap [{where} slot={slot_id} pallet={pallet_id}]: "
+                    f"{a.sku}@({a.pos_x:.3f},{a.pos_y:.3f},{a.pos_z:.3f}) "
+                    f"intersects {b.sku}@({b.pos_x:.3f},{b.pos_y:.3f},{b.pos_z:.3f}) "
+                    f"by {vol * 1000:.1f} L ({ratio * 100:.0f}% of smaller item)"
+                )
+                _print_error(msg)
+                out.append(
+                    ValidationIssue(
+                        severity=ValidationSeverity.ERROR,
+                        code="OVERLAP",
+                        message=msg,
+                        where=f"slot {slot_id}",
+                        detail={
+                            "slot_id": slot_id,
+                            "pallet_id": pallet_id,
+                            "sku_a": a.sku,
+                            "sku_b": b.sku,
+                            "pos_a": [round(a.pos_x, 4), round(a.pos_y, 4), round(a.pos_z, 4)],
+                            "dim_a": [round(a.dim_x, 4), round(a.dim_y, 4), round(a.dim_h, 4)],
+                            "pos_b": [round(b.pos_x, 4), round(b.pos_y, 4), round(b.pos_z, 4)],
+                            "dim_b": [round(b.dim_x, 4), round(b.dim_y, 4), round(b.dim_h, 4)],
+                            "overlap_volume_m3": round(vol, 6),
+                            "overlap_ratio": round(ratio, 4),
+                            "where_phase": where,
+                        },
+                    )
+                )
+    return out
+
+
+# Maps the simulator's PHYSICS_VIOLATION codes to validator codes. The
+# simulator emits one event per offending pair on every state change,
+# so we deduplicate by (code, slot, sku, pos rounded to mm).
+_PHYSICS_CODE_MAP = {
+    "OVERLAP": "OVERLAP",
+    "OUT_OF_BOUNDS": "OUT_OF_BOUNDS",
+    "FLOATING": "FLOATING_ITEM",
+    "UNSTABLE_OVERHANG": "UNSTABLE_OVERHANG",
+    "HEIGHT_OVERFLOW": "PALLET_HEIGHT_EXCEEDS_TRUCK",
+    # When the simulator detects an algorithm-supplied position would
+    # overlap and snaps to a clean spot (or drops the empty), surface
+    # it as an OVERLAP error too — the algorithm is buggy even if the
+    # final state is clean.
+    "PICKUP_OVERLAP_SNAPPED": "OVERLAP",
+    "RESTOCK_OVERLAP_SNAPPED": "OVERLAP",
+    "PICKUP_DROPPED_NO_FIT": "OVERLAP",
+    # Item left floating after the supporter was delivered, and the
+    # simulator dropped it to a supported anchor. Surface as
+    # FLOATING_ITEM so the algorithm bug stays visible.
+    "SETTLE": "FLOATING_ITEM",
+}
+
+
+def _check_runtime_physics(result: SimulationResult) -> list[ValidationIssue]:
+    """Surface PHYSICS_VIOLATION events from the simulator log as
+    validator issues. OVERLAP, OUT_OF_BOUNDS and FLOATING are always
+    ERROR severity. Each unique violation is printed once to stderr."""
+    out: list[ValidationIssue] = []
+    seen: set[tuple] = set()
+    for rec in result.log.to_records():
+        if rec.get("kind") != "PHYSICS_VIOLATION":
+            continue
+        code = str(rec.get("code") or "")
+        if code == "HEIGHT_OVERFLOW":
+            # Soft — handled by PALLET_HEIGHT_EXCEEDS_TRUCK from the
+            # cargo path. Skip to avoid double-reporting.
+            continue
+        validator_code = _PHYSICS_CODE_MAP.get(code, "PHYSICS_VIOLATION")
+        pos_a = rec.get("pos") or rec.get("pos_a") or [0.0, 0.0, 0.0]
+        pos_b = rec.get("pos_b") or [0.0, 0.0, 0.0]
+        key = (
+            code,
+            rec.get("slot_id"),
+            rec.get("sku") or rec.get("sku_a"),
+            rec.get("sku_b"),
+            tuple(round(float(x), 3) for x in pos_a),
+            tuple(round(float(x), 3) for x in pos_b),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        msg = str(rec.get("message") or f"Physics violation: {code}")
+        _print_error(f"runtime {code}: {msg}")
+        out.append(
+            ValidationIssue(
+                severity=ValidationSeverity.ERROR,
+                code=validator_code,
+                message=msg,
+                where=str(rec.get("where") or "runtime"),
+                detail={
+                    "slot_id": rec.get("slot_id"),
+                    "sku": rec.get("sku") or rec.get("sku_a"),
+                    "sku_b": rec.get("sku_b"),
+                    "pos": list(pos_a),
+                    "pos_b": list(pos_b),
+                    "t_min": rec.get("t_min"),
+                    "raw_code": code,
+                },
+            )
+        )
     return out
 
 
@@ -532,6 +727,13 @@ def _check_cargo(case: DayCase, state: WorldState) -> list[ValidationIssue]:
                         )
                     )
 
+        # Stack stability — narrow towers tip over. Looks at every
+        # vertical column of items sharing roughly the same xy footprint
+        # and rejects total stack height greater than STACK_RATIO_ERROR ×
+        # the smaller footprint side. Single low items are exempt
+        # (anything below STACK_MIN_HEIGHT_M is too short to topple).
+        out.extend(_check_stack_stability(slot_id, pallet))
+
     # Center of mass + side balance.
     com = _center_of_mass(state)
     side_weight = _side_weights(state)
@@ -648,6 +850,82 @@ def _center_of_mass(state: WorldState) -> tuple[float, float, float] | None:
     if total <= 0:
         return None
     return (sx / total, sy / total, sz / total)
+
+
+def _stack_columns(pallet: Pallet) -> dict[tuple[float, float], list[PalletItem]]:
+    """Group items into vertical "columns" — items whose xy footprint
+    overlaps share a column. We pick the smallest item as the column
+    seed and pull anything that overlaps it onto the same key. Used by
+    the stability check below."""
+
+    cols: dict[tuple[float, float], list[PalletItem]] = {}
+    items = sorted(
+        (it for it in pallet.items if it.qty > 0),
+        key=lambda it: (it.pos_z, it.pos_x, it.pos_y),
+    )
+    for it in items:
+        # Match against existing column seeds: same anchored x/y means
+        # same column. Tolerance avoids float noise on stacked items.
+        key = (round(it.pos_x, 3), round(it.pos_y, 3))
+        cols.setdefault(key, []).append(it)
+    return cols
+
+
+def _check_stack_stability(slot_id: str, pallet: Pallet) -> list[ValidationIssue]:
+    out: list[ValidationIssue] = []
+    cols = _stack_columns(pallet)
+
+    for (cx, cy), items in cols.items():
+        if not items:
+            continue
+        min_x = min(it.dim_x for it in items)
+        min_y = min(it.dim_y for it in items)
+        narrow = min(min_x, min_y)
+        if narrow <= 0:
+            continue
+
+        floor = min(it.pos_z for it in items)
+        top = max(it.top_z for it in items)
+        height = top - floor
+        if height < STACK_MIN_HEIGHT_M:
+            continue
+
+        ratio = height / narrow
+        if ratio <= STACK_RATIO_WARN:
+            continue
+
+        severity = (
+            ValidationSeverity.ERROR
+            if ratio > STACK_RATIO_ERROR
+            else ValidationSeverity.WARNING
+        )
+        code = "STACK_UNSTABLE" if severity == ValidationSeverity.ERROR else "STACK_WOBBLY"
+        sample = items[0]
+        out.append(
+            ValidationIssue(
+                severity=severity,
+                code=code,
+                message=(
+                    f"Stack at ({cx:.2f}, {cy:.2f}) of {slot_id} is "
+                    f"{height:.2f} m tall on a {narrow:.2f} m base "
+                    f"(ratio {ratio:.1f}, max {STACK_RATIO_ERROR:.1f}) — "
+                    f"narrow tower of {sample.physical_type} will topple"
+                ),
+                where=f"slot {slot_id}, col ({cx:.2f},{cy:.2f})",
+                detail={
+                    "pallet_id": pallet.pallet_id,
+                    "pos_x": cx,
+                    "pos_y": cy,
+                    "stack_height_m": round(height, 3),
+                    "footprint_min_m": round(narrow, 3),
+                    "ratio": round(ratio, 2),
+                    "limit_ratio": STACK_RATIO_ERROR,
+                    "warn_ratio": STACK_RATIO_WARN,
+                    "physical_type": sample.physical_type,
+                },
+            )
+        )
+    return out
 
 
 def _side_weights(state: WorldState) -> tuple[float, float] | None:

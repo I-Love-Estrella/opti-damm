@@ -19,6 +19,7 @@ function Playback3D({ run }) {
   const stops = run?.data?.stops || [];
   const initialCargo = run?.data?.initial_cargo || [];
   const truck = run?.data?.truck;
+  const violations = run?.data?.physics_violations || [];
 
   const flatStages = useMemo(() => flattenStages(stops), [stops]);
   const liftMaps = useMemo(() => buildLiftReplaceMap(flatStages), [flatStages]);
@@ -27,6 +28,29 @@ function Playback3D({ run }) {
   const [speed, setSpeed] = useState(2);
   const rootRef = useRef(null);
 
+  // Map a violation seq to the closest stage index in flatStages so the
+  // operator can jump straight to "this is where the truck broke".
+  const violationStops = useMemo(() => {
+    return violations.map((v) => {
+      const seq = v.seq ?? 0;
+      let idxAtOrAfter = flatStages.findIndex((s) => (s.seq ?? 0) >= seq);
+      if (idxAtOrAfter < 0) idxAtOrAfter = flatStages.length;
+      return { ...v, stage_idx: idxAtOrAfter + 1 };
+    });
+  }, [violations, flatStages]);
+
+  // Auto-pause when playback reaches the first violation.
+  const firstViolationIdx = violationStops[0]?.stage_idx ?? null;
+  useEffect(() => {
+    if (
+      isPlaying &&
+      firstViolationIdx !== null &&
+      idx >= firstViolationIdx
+    ) {
+      setIsPlaying(false);
+    }
+  }, [idx, isPlaying, firstViolationIdx]);
+
   const state = useMemo(
     () => cargoStateAt(initialCargo, flatStages, idx),
     [initialCargo, flatStages, idx],
@@ -34,8 +58,45 @@ function Playback3D({ run }) {
 
   if (!truck || flatStages.length === 0) return null;
 
+  const atViolation = violationStops.some((v) => idx >= v.stage_idx);
+
   return (
-    <div className="playback3d" ref={rootRef}>
+    <div className={`playback3d ${atViolation ? 'playback-broken' : ''}`} ref={rootRef}>
+      {violationStops.length > 0 && (
+        <div className="physics-banner">
+          <div className="physics-banner-title">
+            ⚠ {violationStops.length} PHYSICS VIOLATION
+            {violationStops.length > 1 ? 'S' : ''} — truck cannot be driven
+          </div>
+          <ul className="physics-banner-list">
+            {violationStops.slice(0, 50).map((v, i) => (
+              <li key={i}>
+                <span className={`pv-tag pv-${(v.code || '').toLowerCase()}`}>
+                  {v.code}
+                </span>
+                <span className="pv-where">
+                  step #{v.stage_idx} · {v.where || ''}
+                </span>
+                <span className="pv-msg">{v.message}</span>
+                <button
+                  className="btn-jump"
+                  onClick={() => {
+                    setIsPlaying(false);
+                    setIdx(v.stage_idx);
+                  }}
+                >
+                  Jump to step ▸
+                </button>
+              </li>
+            ))}
+            {violationStops.length > 50 && (
+              <li className="pv-more">
+                + {violationStops.length - 50} more violations
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
       <Truck3D
         truck={truck}
         palletsBySlot={state.palletsBySlot}
@@ -127,6 +188,8 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
   const truck = run?.data?.truck;
   const validation = run?.data?.validation;
   const planInvalid = validation && !validation.summary?.is_valid;
+  const physicsViolations = run?.data?.physics_violations || [];
+  const hasPhysicsViolations = physicsViolations.length > 0;
 
   return (
     <section className={`algo-section${planInvalid ? ' algo-section-invalid' : ''}`}>
@@ -138,6 +201,11 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
           {planInvalid && (
             <span className="algo-invalid-badge">
               ✕ INVALID — {validation.summary.errors} error(s)
+            </span>
+          )}
+          {hasPhysicsViolations && (
+            <span className="algo-physics-badge">
+              ⚠ {physicsViolations.length} PHYSICS
             </span>
           )}
         </div>

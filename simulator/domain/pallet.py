@@ -160,6 +160,21 @@ class PalletItem:
 
     @property
     def stack_size(self) -> int:
+        """Number of PHYSICAL units in this stack — the count the
+        simulator and frontend split events/cubes by.
+
+        Older builds derived this from `dim_h / 0.30 m` (a legacy
+        discrete-cell assumption). That breaks for kegs whose unit
+        height is 0.65 m: a 2-keg stack reports stack_size=5 but only
+        has 2 physical units. The simulator delivers 2, the frontend
+        renders 5, three "ghost kegs" remain visible after delivery
+        and overlap with newly-arriving empties.
+
+        Now we trust `qty` whenever it's set (round to the nearest
+        whole unit). The legacy formula stays as a fallback for items
+        without qty (defensive — shouldn't happen in normal flow)."""
+        if self.qty > 0:
+            return max(1, int(round(self.qty)))
         if self.dim_h <= 0:
             return 0
         return max(1, int(ceil(self.dim_h / _LEGACY_CELL_H_M)))
@@ -337,6 +352,23 @@ class Pallet:
                     dim_h=it.dim_h - kept.dim_h,
                 )
                 new_items.append(kept)
+                continue
+            new_items.append(it)
+        return self.with_items(tuple(new_items)), removed
+
+    def remove_specific(self, target: PalletItem) -> tuple["Pallet", PalletItem | None]:
+        """Remove the *exact* item by Python identity (`is` check).
+
+        Use when there are several items with the same (sku, client) on
+        the pallet and the caller knows which one to drop — e.g. Phase 4
+        of unloading, which restocks specific blockers it identified by
+        position.
+        """
+        new_items: list[PalletItem] = []
+        removed: PalletItem | None = None
+        for it in self.items:
+            if removed is None and it is target:
+                removed = it
                 continue
             new_items.append(it)
         return self.with_items(tuple(new_items)), removed

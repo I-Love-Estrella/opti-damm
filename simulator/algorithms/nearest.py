@@ -11,7 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from simulator.algorithms.base import Algorithm
+from simulator.algorithms.virtual_truck import VirtualTruck
 from simulator.config import PALLET_VOLUME_M3
+from simulator.data.catalog import physical_dims
 from simulator.data.clients import Clients
 from simulator.data.network import Network
 from simulator.data.orders import ClientOrder, DayCase, OrderLine
@@ -26,9 +28,43 @@ from simulator.domain.commands import (
     ReturnDepot,
     Unload,
 )
-from simulator.domain.pallet import PalletClass, PalletKind, sku_class_for_uma
+from simulator.domain.packing import find_position
+from simulator.domain.pallet import (
+    PalletClass,
+    PalletItem,
+    PalletKind,
+    sku_class_for_uma,
+)
 from simulator.domain.plan import Plan
 from simulator.domain.truck import build_slots
+
+
+def _line_dims(line: OrderLine) -> tuple[float, float, float]:
+    """Per-unit (dim_x, dim_y, dim_h) for an order line — real ZM040 dims if
+    available, else type defaults."""
+
+    if line.dim_source == "data" and line.dim_x_m > 0 and line.dim_y_m > 0 and line.dim_h_m > 0:
+        return line.dim_x_m, line.dim_y_m, line.dim_h_m
+    ptype = line.physical_type.value if hasattr(line.physical_type, "value") else str(line.physical_type)
+    return physical_dims(ptype)
+
+
+def _physical_type_str(line: OrderLine) -> str:
+    return line.physical_type.value if hasattr(line.physical_type, "value") else str(line.physical_type)
+
+
+# Stack stability: height ≤ STACK_RATIO × narrow side. Matches the
+# validator's STACK_RATIO_ERROR — we cap the per-Pick stack here so the
+# simpler algorithms can't accidentally emit a narrow tower.
+_STACK_RATIO = 3.5
+
+
+def _stack_chunk_qty(qty: float, dx: float, dy: float, dh: float) -> float:
+    """Largest qty that fits the stack-stability rule for a single Pick."""
+
+    narrow = max(1e-3, min(dx, dy))
+    max_units = max(1, int((_STACK_RATIO * narrow) / max(dh, 1e-3)))
+    return float(min(qty, max_units))
 
 
 @dataclass
@@ -56,8 +92,11 @@ class NearestNeighborSmart(Algorithm):
         rationale.append(f"Pallet groups: {len(groups)} (truck capacity {case.truck.pallet_capacity}).")
 
         cmds: list[Command] = []
-        # For each group, split client lines by class (KEG vs BOX) — one
-        # sub-pallet per (group, class). Track slot per (client, class).
+        # Track virtual pallet contents per pallet_id so we can compute Pick
+        # positions ourselves — the simulator no longer infers geometry.
+        items_by_pid: dict[str, list[PalletItem]] = {}
+        pid_to_slot: dict[str, str] = {}
+
         client_class_to_slot: dict[tuple[str, PalletClass], str] = {}
         for g in groups:
             lines_by_class: dict[PalletClass, list[tuple[str, "OrderLine"]]] = {
@@ -72,59 +111,104 @@ class NearestNeighborSmart(Algorithm):
 
             sub_idx = 0
             for cls in (PalletClass.BOX, PalletClass.KEG):
-                items = lines_by_class[cls]
-                if not items:
+                lines = lines_by_class[cls]
+                if not lines:
                     continue
                 pid = g.pallet_id if sub_idx == 0 else f"{g.pallet_id}-{cls.value}"
-                slot_id = g.slot_id if sub_idx == 0 else g.slot_id  # share slot or extend
+                slot_id = g.slot_id if sub_idx == 0 else g.slot_id
                 primary = g.clients[-1].client_id if len(g.clients) == 1 else None
                 kind = PalletKind.CLIENT_BLOCK.value if primary else PalletKind.MIXED.value
                 note = f"clients={[c.client_id for c in g.clients]} class={cls.value}"
-                cmds.append(BuildPallet(pallet_id=pid, kind=kind, primary_client=primary, notes=note))
-                for cid, line in items:
-                    cmds.append(
-                        Pick(
-                            sku=line.sku,
-                            qty=line.qty,
-                            location=None,
-                            pallet_id=pid,
-                            intended_client=cid,
-                        )
+                cmds.append(BuildPallet(
+                    pallet_id=pid,
+                    kind=kind,
+                    primary_client=primary,
+                    notes=note,
+                    pallet_class=cls.value,
+                ))
+                items_by_pid[pid] = []
+                for cid, line in lines:
+                    self._append_pick(
+                        cmds, items_by_pid[pid], pid, cid, line, line.qty
                     )
                 if sub_idx == 0:
                     cmds.append(Load(pallet_id=pid, slot_id=slot_id))
-                    for cid, _ in items:
+                    pid_to_slot[pid] = slot_id
+                    for cid, _ in lines:
                         client_class_to_slot[(cid, cls)] = slot_id
                 else:
-                    # second class — try to find a free slot; fall back to same slot
                     free_slot = self._first_free_slot(case, cmds)
                     target_slot = free_slot or slot_id
                     cmds.append(Load(pallet_id=pid, slot_id=target_slot))
-                    for cid, _ in items:
+                    pid_to_slot[pid] = target_slot
+                    for cid, _ in lines:
                         client_class_to_slot[(cid, cls)] = target_slot
                 sub_idx += 1
 
         cmds.append(DepartDepot())
 
+        # Shadow truck for picking PickupReturn anchors.
+        vt = VirtualTruck()
+        for pid, items in items_by_pid.items():
+            slot_id = pid_to_slot.get(pid)
+            if slot_id is None:
+                continue
+            for it in items:
+                vt.add(slot_id, it)
+
+        keg_dx, keg_dy, keg_dh = physical_dims("keg")
+
         for o in order:
             cmds.append(DriveTo(client_id=o.client_id))
+            splits_by_slot: dict[str, list[tuple[str, float]]] = {}
             for line in o.lines:
                 cls = sku_class_for_uma(line.uma)
                 slot_id = client_class_to_slot.get(
                     (o.client_id, cls)
                 ) or client_class_to_slot.get((o.client_id, PalletClass.BOX), "L1")
-                cmds.append(Unload(client_id=o.client_id, sku=line.sku, qty=line.qty, slot_id=slot_id))
+                splits_by_slot.setdefault(slot_id, []).append((line.sku, line.qty))
+
+            for slot_id, items in splits_by_slot.items():
+                target_keys = [(sku, o.client_id) for sku, _ in items]
+                target_items, same_client, foreign = vt.find_blockers(
+                    slot_id, target_keys
+                )
+                ordered_lifts = sorted(
+                    foreign + same_client,
+                    key=lambda b: (b.pos_y, b.pos_x, -b.pos_z),
+                )
+                lifts = vt.to_lifts(ordered_lifts)
+                restock = vt.plan_restock(
+                    slot_id, target_items, same_client, foreign,
+                    aspect_limit=_STACK_RATIO,
+                )
+                first = True
+                for sku, qty in items:
+                    cmds.append(
+                        Unload(
+                            client_id=o.client_id,
+                            sku=sku,
+                            qty=qty,
+                            slot_id=slot_id,
+                            lifts=tuple(lifts) if first else (),
+                            restock=tuple(restock) if first else (),
+                        )
+                    )
+                    first = False
+                vt.apply_restock(slot_id, restock, target_items, same_client, foreign)
             if o.expected_returnable_units > 0:
                 slot_id = client_class_to_slot.get(
                     (o.client_id, PalletClass.KEG)
                 ) or client_class_to_slot.get((o.client_id, PalletClass.BOX), "L1")
-                cmds.append(
-                    PickupReturn(
-                        client_id=o.client_id,
-                        sku="EMPTY",
-                        qty=o.expected_returnable_units,
-                        slot_id=slot_id,
-                    )
+                vt.emit_returnables(
+                    cmds,
+                    slot_id,
+                    o.client_id,
+                    o.expected_returnable_units,
+                    keg_dx,
+                    keg_dy,
+                    keg_dh,
+                    candidate_slots=list(pid_to_slot.values()),
                 )
         cmds.append(ReturnDepot())
 
@@ -134,6 +218,71 @@ class NearestNeighborSmart(Algorithm):
             rationale=tuple(rationale),
             route_order=tuple(o.client_id for o in order),
         )
+
+    @staticmethod
+    def _append_pick(
+        cmds: list[Command],
+        items: list[PalletItem],
+        pid: str,
+        cid: str,
+        line: OrderLine,
+        qty: float,
+    ) -> None:
+        dx, dy, dh_unit = _line_dims(line)
+        ptype = _physical_type_str(line)
+        remaining = float(qty)
+        # Split into stack-stable chunks so the validator doesn't trip
+        # the STACK_UNSTABLE rule on tall narrow towers.
+        while remaining > 0:
+            take = _stack_chunk_qty(remaining, dx, dy, dh_unit)
+            stack_h = take * dh_unit
+            pos = find_position(
+                items, dx, dy, stack_h,
+                enforce_pallet_height=True,
+                aspect_limit=_STACK_RATIO,
+            )
+            if pos is None:
+                pos = find_position(
+                    items, dx, dy, stack_h, enforce_pallet_height=True
+                )
+            if pos is None:
+                remaining -= take
+                continue
+            item = PalletItem(
+                sku=line.sku,
+                qty=take,
+                unit_volume_m3=line.unit_volume_m3,
+                unit_weight_kg=line.unit_weight_kg,
+                intended_client=cid,
+                is_returnable_empty=False,
+                physical_type=ptype,
+                pos_x=pos[0],
+                pos_y=pos[1],
+                pos_z=pos[2],
+                dim_x=dx,
+                dim_y=dy,
+                dim_h=stack_h,
+            )
+            items.append(item)
+            cmds.append(
+                Pick(
+                    sku=line.sku,
+                    qty=take,
+                    location=None,
+                    pallet_id=pid,
+                    intended_client=cid,
+                    pos_x=pos[0],
+                    pos_y=pos[1],
+                    pos_z=pos[2],
+                    dim_x=dx,
+                    dim_y=dy,
+                    dim_h=stack_h,
+                    unit_volume_m3=line.unit_volume_m3,
+                    unit_weight_kg=line.unit_weight_kg,
+                    physical_type=ptype,
+                )
+            )
+            remaining -= take
 
     def _route(self, case: DayCase, clients: Clients, network: Network) -> list[ClientOrder]:
         remaining = list(case.orders)

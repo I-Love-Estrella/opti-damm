@@ -12,7 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from simulator.algorithms.base import Algorithm
+from simulator.algorithms.virtual_truck import VirtualTruck
 from simulator.config import PALLET_VOLUME_M3
+from simulator.data.catalog import physical_dims
 from simulator.data.clients import Clients
 from simulator.data.network import Network
 from simulator.data.orders import DayCase, OrderLine
@@ -27,9 +29,35 @@ from simulator.domain.commands import (
     ReturnDepot,
     Unload,
 )
-from simulator.domain.pallet import PalletClass, PalletKind, sku_class_for_uma
+from simulator.domain.packing import find_position
+from simulator.domain.pallet import (
+    PalletClass,
+    PalletItem,
+    PalletKind,
+    sku_class_for_uma,
+)
 from simulator.domain.plan import Plan
 from simulator.domain.truck import build_slots
+
+
+def _line_dims(line: OrderLine) -> tuple[float, float, float]:
+    if line.dim_source == "data" and line.dim_x_m > 0 and line.dim_y_m > 0 and line.dim_h_m > 0:
+        return line.dim_x_m, line.dim_y_m, line.dim_h_m
+    ptype = line.physical_type.value if hasattr(line.physical_type, "value") else str(line.physical_type)
+    return physical_dims(ptype)
+
+
+def _physical_type_str(line: OrderLine) -> str:
+    return line.physical_type.value if hasattr(line.physical_type, "value") else str(line.physical_type)
+
+
+_STACK_RATIO = 3.5
+
+
+def _stack_chunk_qty(qty: float, dx: float, dy: float, dh: float) -> float:
+    narrow = max(1e-3, min(dx, dy))
+    max_units = max(1, int((_STACK_RATIO * narrow) / max(dh, 1e-3)))
+    return float(min(qty, max_units))
 
 
 @dataclass
@@ -63,6 +91,10 @@ class ReplayBaseline(Algorithm):
         unload_slot: dict[tuple[str, str], list[tuple[str, float]]] = {}
         overflow: list[tuple[str, str, float]] = []
         next_id = [0]
+        # Virtual pallet contents — used to compute Pick positions ourselves
+        # since the simulator no longer infers geometry.
+        items_by_pid: dict[str, list[PalletItem]] = {}
+        class_by_pid: dict[str, PalletClass] = {}
 
         def new_id() -> str:
             next_id[0] += 1
@@ -79,7 +111,8 @@ class ReplayBaseline(Algorithm):
                 cid, qty = remaining[0]
                 want = qty * line.unit_volume_m3
                 target = self._fit(open_pallets, want) or self._open(
-                    slot_iter, new_id, cmds, open_pallets, sku
+                    slot_iter, new_id, cmds, open_pallets, sku, cls,
+                    items_by_pid, class_by_pid,
                 )
                 if target is None:
                     overflow.extend((sku, c, q) for c, q in remaining)
@@ -89,8 +122,9 @@ class ReplayBaseline(Algorithm):
                     open_pallets.remove(target)
                     continue
                 take = min(qty, cap_left / max(line.unit_volume_m3, 1e-6))
-                cmds.append(
-                    Pick(sku=sku, qty=take, location=None, pallet_id=target.pallet_id, intended_client=cid)
+                self._append_pick(
+                    cmds, items_by_pid[target.pallet_id],
+                    target.pallet_id, cid, line, take,
                 )
                 unload_slot.setdefault((cid, sku), []).append((target.slot_id, take))
                 target.cap_left_m3 -= take * line.unit_volume_m3
@@ -112,22 +146,71 @@ class ReplayBaseline(Algorithm):
 
         cmds.append(DepartDepot())
 
+        # Shadow truck — track what's actually on each pallet at every step.
+        # Replay opens each pallet on a single slot, so we map pid → slot via
+        # the open-pallet records that were just emitted.
+        pid_to_slot: dict[str, str] = {}
+        for c in cmds:
+            if isinstance(c, Load):
+                pid_to_slot[c.pallet_id] = c.slot_id
+
+        vt = VirtualTruck()
+        for pid, items in items_by_pid.items():
+            slot_id = pid_to_slot.get(pid)
+            if slot_id is None:
+                continue
+            for it in items:
+                vt.add(slot_id, it)
+
+        keg_dx, keg_dy, keg_dh = physical_dims("keg")
+
         for order in case.orders:
             cmds.append(DriveTo(client_id=order.client_id))
             last_slot = "L1"
+            splits_by_slot: dict[str, list[tuple[str, float]]] = {}
             for line in order.lines:
-                splits = unload_slot.get((order.client_id, line.sku), [])
-                for slot_id, qty in splits:
-                    cmds.append(Unload(client_id=order.client_id, sku=line.sku, qty=qty, slot_id=slot_id))
+                for slot_id, qty in unload_slot.get((order.client_id, line.sku), []):
+                    splits_by_slot.setdefault(slot_id, []).append((line.sku, qty))
                     last_slot = slot_id
-            if order.expected_returnable_units > 0:
-                cmds.append(
-                    PickupReturn(
-                        client_id=order.client_id,
-                        sku="EMPTY",
-                        qty=order.expected_returnable_units,
-                        slot_id=last_slot,
+
+            for slot_id, items in splits_by_slot.items():
+                target_keys = [(sku, order.client_id) for sku, _ in items]
+                target_items, same_client, foreign = vt.find_blockers(
+                    slot_id, target_keys
+                )
+                ordered_lifts = sorted(
+                    foreign + same_client,
+                    key=lambda b: (b.pos_y, b.pos_x, -b.pos_z),
+                )
+                lifts = vt.to_lifts(ordered_lifts)
+                restock = vt.plan_restock(
+                    slot_id, target_items, same_client, foreign,
+                    aspect_limit=_STACK_RATIO,
+                )
+                first = True
+                for sku, qty in items:
+                    cmds.append(
+                        Unload(
+                            client_id=order.client_id,
+                            sku=sku,
+                            qty=qty,
+                            slot_id=slot_id,
+                            lifts=tuple(lifts) if first else (),
+                            restock=tuple(restock) if first else (),
+                        )
                     )
+                    first = False
+                vt.apply_restock(slot_id, restock, target_items, same_client, foreign)
+            if order.expected_returnable_units > 0:
+                vt.emit_returnables(
+                    cmds,
+                    last_slot,
+                    order.client_id,
+                    order.expected_returnable_units,
+                    keg_dx,
+                    keg_dy,
+                    keg_dh,
+                    candidate_slots=list(pid_to_slot.values()),
                 )
         cmds.append(ReturnDepot())
 
@@ -165,6 +248,71 @@ class ReplayBaseline(Algorithm):
                 return op
         return open_pallets[0] if open_pallets else None
 
+    @staticmethod
+    def _append_pick(
+        cmds: list[Command],
+        items: list[PalletItem],
+        pid: str,
+        cid: str,
+        line: OrderLine,
+        qty: float,
+    ) -> None:
+        dx, dy, dh_unit = _line_dims(line)
+        ptype = _physical_type_str(line)
+        remaining = float(qty)
+        while remaining > 0:
+            take = _stack_chunk_qty(remaining, dx, dy, dh_unit)
+            stack_h = take * dh_unit
+            pos = find_position(
+                items, dx, dy, stack_h,
+                enforce_pallet_height=True,
+                aspect_limit=_STACK_RATIO,
+            )
+            if pos is None:
+                pos = find_position(
+                    items, dx, dy, stack_h, enforce_pallet_height=True
+                )
+            if pos is None:
+                # No physical room left on this pallet for this chunk.
+                # Skip rather than spawning a floating tower.
+                remaining -= take
+                continue
+            item = PalletItem(
+                sku=line.sku,
+                qty=take,
+                unit_volume_m3=line.unit_volume_m3,
+                unit_weight_kg=line.unit_weight_kg,
+                intended_client=cid,
+                is_returnable_empty=False,
+                physical_type=ptype,
+                pos_x=pos[0],
+                pos_y=pos[1],
+                pos_z=pos[2],
+                dim_x=dx,
+                dim_y=dy,
+                dim_h=stack_h,
+            )
+            items.append(item)
+            cmds.append(
+                Pick(
+                    sku=line.sku,
+                    qty=take,
+                    location=None,
+                    pallet_id=pid,
+                    intended_client=cid,
+                    pos_x=pos[0],
+                    pos_y=pos[1],
+                    pos_z=pos[2],
+                    dim_x=dx,
+                    dim_y=dy,
+                    dim_h=stack_h,
+                    unit_volume_m3=line.unit_volume_m3,
+                    unit_weight_kg=line.unit_weight_kg,
+                    physical_type=ptype,
+                )
+            )
+            remaining -= take
+
     def _open(
         self,
         slot_iter,
@@ -172,14 +320,25 @@ class ReplayBaseline(Algorithm):
         cmds: list[Command],
         open_pallets: list[_OpenPallet],
         sku: str,
+        cls: PalletClass,
+        items_by_pid: dict[str, list[PalletItem]],
+        class_by_pid: dict[str, PalletClass],
     ) -> _OpenPallet | None:
         slot = next(slot_iter, None)
         if slot is None:
             return None
         pid = mk_id()
         cmds.append(
-            BuildPallet(pallet_id=pid, kind=PalletKind.MIXED.value, primary_client=None, notes=f"reference-pack")
+            BuildPallet(
+                pallet_id=pid,
+                kind=PalletKind.MIXED.value,
+                primary_client=None,
+                notes="reference-pack",
+                pallet_class=cls.value,
+            )
         )
+        items_by_pid[pid] = []
+        class_by_pid[pid] = cls
         op = _OpenPallet(pallet_id=pid, slot_id=slot.slot_id, cap_left_m3=PALLET_VOLUME_M3)
         open_pallets.append(op)
         return op

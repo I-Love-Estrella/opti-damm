@@ -13,22 +13,14 @@ import {
 import TruckPanel from '@/components/TruckPanel';
 import CopilotPanel from '@/components/CopilotPanel';
 import MetricsBar from '@/components/MetricsBar';
-import WarehousePanel from '@/components/WarehousePanel';
+
 import { api, SIM_API_BASE } from '@/lib/api';
 
 const MapPanel = dynamic(() => import('@/components/MapPanel'), { ssr: false });
 
-const PROMPT_DEFS = [
-  { id: "why",      label: "Why this route order?",        kind: "explain-route" },
-  { id: "compare",  label: "Compare loading modes",        kind: "compare-load" },
-  { id: "traffic",  label: "Traffic on C-17 14:00",        kind: "traffic", alert: true },
-  { id: "cancel",   label: "Cancel Cafeteria Pradals",     kind: "cancel",  alert: true },
-  { id: "reset",    label: "↻ Reset scenario",        kind: "reset",   disabled: true },
-];
-
 const INITIAL_MESSAGES = [
-  { kind: "claude", text: 'Good morning, Manel. <b>Truck 04</b> is loaded — route DR0054 heading north from Mollet. Driver J. Martínez left the depot at 08:14. Three stops complete, four to go. The route is optimised for <b>distance first</b>, with a soft preference for grouping returnables.' },
-  { kind: "claude", text: 'Current ETA back at depot: <b>15:42</b>. Score: 87/100. Ask me anything — or pull a slider and I\'ll re-plan live.' },
+  { kind: "claude", text: 'Good morning, Manel. **Truck 04** is loaded — route DR0054 heading north from Mollet. Driver J. Martínez left the depot at 08:14. Three stops complete, four to go. The route is optimised for **distance first**, with a soft preference for grouping returnables.' },
+  { kind: "claude", text: 'Current ETA back at depot: **15:42**. Score: 87/100. Ask me anything — or pull a slider and I\'ll re-plan live.' },
 ];
 
 const INITIAL_LOG = [
@@ -42,7 +34,6 @@ const INITIAL_LOG = [
 const SECTIONS = [
   { id: 'map', index: '01', title: 'Route' },
   { id: 'truck', index: '02', title: 'Load' },
-  { id: 'warehouse', index: '04', title: 'Warehouse' },
   { id: 'copilot', index: '03', title: 'Co-pilot' },
   { id: 'metrics', index: '—', title: 'Metrics' },
 ];
@@ -108,7 +99,7 @@ function DragHandle({ direction, onDrag }) {
 }
 
 export default function Page() {
-  const [stops, setStops] = useState(STOPS);
+  const [stops] = useState(STOPS);
   const [mode, setMode] = useState("reference");
   const [truckType, setTruckType] = useState("T8");
   const [hoveredStop, setHoveredStop] = useState(null);
@@ -116,7 +107,6 @@ export default function Page() {
   const [selectedClient, setSelectedClient] = useState(null);
   const [messages, setMessages] = useState(INITIAL_MESSAGES);
   const [isTyping, setIsTyping] = useState(false);
-  const [scenario, setScenario] = useState(null);
   const [weights, setWeights] = useState({ route: 60, load: 25, unload: 15 });
   const [now] = useState("10:48");
   const [sysLog, setSysLog] = useState(INITIAL_LOG);
@@ -209,7 +199,7 @@ export default function Page() {
     return () => document.removeEventListener('mousedown', handler);
   }, [panelMenuOpen]);
 
-  const rightStackVisible = !collapsed.has('warehouse') || !collapsed.has('copilot');
+  const rightStackVisible = !collapsed.has('copilot');
 
   const panelGridStyle = useMemo(() => {
     const cols = [];
@@ -299,67 +289,114 @@ export default function Page() {
     };
   }, [weights, stops]);
 
-  const promptList = PROMPT_DEFS.map(p => {
-    if (p.kind === "reset") return { ...p, disabled: !scenario };
-    if (p.kind === "traffic" && scenario === "traffic") return { ...p, disabled: true };
-    if (p.kind === "cancel" && scenario === "cancel") return { ...p, disabled: true };
-    return p;
-  });
+  const visibleStops = stops.filter(s => !s.cancelled);
+  const completed = stops.filter(s => s.status === "completed" && !s.cancelled).length;
+  const nextStop = visibleStops.find(s => s.status === "current") || visibleStops.find(s => s.status === "upcoming");
 
-  const pushMsg = useCallback((m, delay = 0) => {
-    if (delay) {
-      setIsTyping(true);
-      setTimeout(() => {
-        setIsTyping(false);
-        setMessages(prev => [...prev, m]);
-      }, delay);
-    } else {
-      setMessages(prev => [...prev, m]);
-    }
-  }, []);
+  const buildCopilotContext = useCallback((overrides = {}) => {
+    const routeSummary = routeDetail ? {
+      date: routeDetail.date,
+      ruta: routeDetail.ruta,
+      repartidor: routeDetail.repartidor,
+      truck: routeDetail.truck,
+      transports: routeDetail.transports,
+      n_clients: routeDetail.n_clients,
+      total_volume_m3: routeDetail.total_volume_m3,
+      orders: routeDetail.orders?.map(order => ({
+        client_id: order.client_id,
+        client_name: order.client_name,
+        visit_seq: order.visit_seq,
+        expected_returnable_units: order.expected_returnable_units,
+        total_volume_m3: order.total_volume_m3,
+        total_weight_kg: order.total_weight_kg,
+        line_count: order.lines?.length || 0,
+        lines: order.lines?.slice(0, 8),
+      })),
+    } : null;
 
-  function handlePrompt(p) {
-    if (p.kind === "explain-route") {
-      pushMsg({ kind: "user", text: "Why this route order?" });
-      pushMsg({ kind: "claude", text: 'Three constraints stacked: <b>tight windows first</b> (Los Teresitos 08:30, Viena Granollers 09:00), then <b>geographic clustering</b> through Granollers and Vic, and finally <b>Hospital de Manlleu</b> last because it\'s flagged high-priority and the driver wants the empties pickup on the return leg via C-17. Reversing 5 and 6 saves 0.4 km but breaks Area Truck Shell\'s window.' }, 700);
-      pushLog({ tag: "QUERY", level: "info", msg: "EXPLAIN-ROUTE · RTE-A" });
+    return {
+      selected_route: selectedRoute,
+      route_detail: routeSummary,
+      load_mode: mode,
+      truck_type: truckType,
+      selected_client: selectedClient,
+      hovered_stop: hoveredStop,
+      metrics,
+      weights,
+      visible_stops: visibleStops.map(s => ({
+        id: s.id,
+        code: s.code,
+        name: s.name,
+        status: s.status,
+        window: s.window,
+        eta: s.eta,
+        pallets: s.pallets,
+        priority: s.priority,
+        cancelled: s.cancelled || false,
+      })),
+      pallet_summary: {
+        total_slots: pallets.length,
+        filled_slots: filledPallets.length,
+        returnable_percent: returnableCount,
+        mode,
+        sample: pallets.filter(p => p.sku).slice(0, 16),
+      },
+      system_log: sysLog.slice(-8),
+      ...overrides,
+    };
+  }, [
+    selectedRoute,
+    routeDetail,
+    mode,
+    truckType,
+    selectedClient,
+    hoveredStop,
+    metrics,
+    weights,
+    visibleStops,
+    pallets,
+    filledPallets.length,
+    returnableCount,
+    sysLog,
+  ]);
+
+  const askCopilot = useCallback(async (text, contextOverrides = {}) => {
+    const userText = text.trim();
+    if (!userText || isTyping) return;
+
+    const outgoingMessages = messages
+      .filter(m => m.kind === 'user' || m.kind === 'claude')
+      .slice(-10)
+      .map(m => ({
+        role: m.kind === 'user' ? 'user' : 'assistant',
+        text: m.text,
+      }));
+
+    setMessages(prev => [...prev, { kind: 'user', text: userText }]);
+    setIsTyping(true);
+    pushLog({ tag: "COPILOT", level: "info", msg: "GEMINI REQUEST" });
+
+    try {
+      const response = await api.copilotChat({
+        message: userText,
+        messages: outgoingMessages,
+        frontendContext: buildCopilotContext(contextOverrides),
+      });
+      setMessages(prev => [...prev, { kind: 'claude', text: response.reply || '' }]);
+      const tools = response.tool_calls?.map(t => t.name).filter(Boolean);
+      pushLog({
+        tag: "COPILOT",
+        level: "ok",
+        msg: tools?.length ? `TOOLS · ${tools.join(', ').toUpperCase()}` : `MODEL · ${response.model}`,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : 'Unknown copilot error';
+      setMessages(prev => [...prev, { kind: 'alert', text: `Copilot unavailable: ${detail}` }]);
+      pushLog({ tag: "COPILOT", level: "info", msg: "ERROR · CHECK GEMINI API KEY" });
+    } finally {
+      setIsTyping(false);
     }
-    if (p.kind === "compare-load") {
-      pushMsg({ kind: "user", text: "Compare loading modes." });
-      pushMsg({ kind: "claude", text: '<b>By Reference</b>: fastest pick at the depot — same SKUs together. Slower at each stop. <b>By Client</b>: 4 min faster per stop on average; bigger pick window. <b>Hybrid</b>: client groups but heavies near the cab, balances axle weight. Right now you\'re on <b>By Reference</b> — switch to Hybrid for this run; it shaves ~7 minutes.' }, 750);
-      pushLog({ tag: "QUERY", level: "info", msg: "COMPARE-LOAD · 3 MODES" });
-    }
-    if (p.kind === "traffic") {
-      setScenario("traffic");
-      pushMsg({ kind: "alert", text: "Traffic incident — C-17 closed at Centelles 14:00–14:40. Three upcoming stops affected." });
-      pushMsg({ kind: "user", text: "Re-plan around it." });
-      pushMsg({ kind: "claude", text: 'Already done. Routing through <b>BV-5301</b> instead of C-17 between Vic and Manlleu. Adds 1.8 km but stays within all delivery windows. <b>Hospital de Manlleu</b> moves from 14:00 to 14:18 — still on time. Score drops 87 → 82.' }, 800);
-      setWeights(w => ({ ...w, route: Math.max(30, w.route - 8), unload: Math.min(40, w.unload + 5) }));
-      pushLog({ tag: "ALERT", level: "info", msg: "TRAFFIC · C-17 CLOSED 14:00-14:40" });
-      pushLog({ tag: "REPLAN", level: "ok", msg: "RTE-A → RTE-A2 · BV-5301 DETOUR" });
-    }
-    if (p.kind === "cancel") {
-      setScenario("cancel");
-      pushMsg({ kind: "alert", text: "Cafeteria Pradals cancelled the order. 1 pallet, EST 33CL × 24." });
-      pushMsg({ kind: "user", text: "Drop the stop and re-optimise." });
-      setTimeout(() => {
-        setStops(prev => prev.map(s => s.id === 4 ? { ...s, cancelled: true } : s));
-        if (selectedClient && selectedClient.id === 4) setSelectedClient(null);
-      }, 250);
-      pushMsg({ kind: "claude", text: 'Stop dropped. Route shortened from 7 to 6 stops, distance falls <b>11.4 km</b>, ETA back to depot now <b>14:58</b>. EST pallet stays loaded — re-route to tomorrow\'s 08:30 delivery. <b>Score climbs to 91</b>.' }, 900);
-      setWeights(w => ({ ...w, load: Math.min(40, w.load + 6) }));
-      pushLog({ tag: "CANCEL", level: "info", msg: "S-04 CAFETERIA PRADALS · 1 PLT EST RE-ROUTED" });
-      pushLog({ tag: "REPLAN", level: "ok", msg: "RTE-A → RTE-B · 6 STOPS · -11.4 KM" });
-    }
-    if (p.kind === "reset") {
-      setStops(STOPS);
-      setScenario(null);
-      setSelectedClient(null);
-      setWeights({ route: 60, load: 25, unload: 15 });
-      pushMsg({ kind: "claude", text: 'Scenario reset. Back to the original 7-stop run.' });
-      pushLog({ tag: "RESET", level: "info", msg: "BASELINE RESTORED · RTE-A" });
-    }
-  }
+  }, [buildCopilotContext, isTyping, messages, pushLog]);
 
   const hoveredPalletStops = hoveredPallet ? [hoveredPallet.stop] : [];
 
@@ -401,10 +438,6 @@ export default function Page() {
   }
 
   const spec = TRUCK_TYPES[truckType];
-  const visibleStops = stops.filter(s => !s.cancelled);
-  const completed = stops.filter(s => s.status === "completed" && !s.cancelled).length;
-  const nextStop = visibleStops.find(s => s.status === "current") || visibleStops.find(s => s.status === "upcoming");
-
   return (
     <div className="app" style={appGridStyle}>
       <div className="classification">
@@ -574,18 +607,11 @@ export default function Page() {
 
         {rightStackVisible && (
           <div className="right-stack">
-            {!collapsed.has('warehouse') && (
-              <Section id="warehouse" collapsed={false} fullscreen={fullscreenPanel === 'warehouse'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen} style={!collapsed.has('copilot') ? { flex: `0 0 ${rightSplit * 100}%` } : undefined}>
-                <WarehousePanel />
-                {!collapsed.has('copilot') && <DragHandle direction="vertical" onDrag={handleRightStackDrag} />}
-              </Section>
-            )}
             {!collapsed.has('copilot') && (
               <Section id="copilot" collapsed={false} fullscreen={fullscreenPanel === 'copilot'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen}>
                 <CopilotPanel
                   messages={messages}
-                  prompts={promptList}
-                  onPrompt={handlePrompt}
+                  onAsk={askCopilot}
                   isTyping={isTyping}
                   sysLog={sysLog}
                 />

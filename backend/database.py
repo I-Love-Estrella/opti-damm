@@ -5,6 +5,10 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
+from backend.env import load_local_env
+
+load_local_env()
+
 DEFAULT_DATABASE_URL = "postgresql+psycopg://damm:damm@localhost:5432/damm"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
 

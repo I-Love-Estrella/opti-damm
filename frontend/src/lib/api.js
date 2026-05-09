@@ -45,6 +45,15 @@ export const api = {
     }),
   routes: () => jsonRequest('/routes'),
   routeDetail: (date, ruta) => jsonRequest(`/routes/${date}/${ruta}`),
+  copilotChat: ({ message, messages = [], frontendContext = {} }) =>
+    jsonRequest('/copilot/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        messages,
+        frontend_context: frontendContext,
+      }),
+    }),
 };
 
 export const SIM_API_BASE = BASE;

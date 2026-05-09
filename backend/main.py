@@ -14,10 +14,7 @@ from backend.routers.simulator import router as simulator_router
 
 
 def _allowed_origins() -> list[str]:
-    raw = os.getenv("ALLOWED_ORIGINS")
-    if raw:
-        return [origin.strip() for origin in raw.split(",") if origin.strip()]
-    return [
+    defaults = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:3001",
@@ -25,6 +22,9 @@ def _allowed_origins() -> list[str]:
         "https://optidamm.ink",
         "https://www.optidamm.ink",
     ]
+    raw = os.getenv("ALLOWED_ORIGINS")
+    configured = [origin.strip() for origin in raw.split(",") if origin.strip()] if raw else []
+    return list(dict.fromkeys([*defaults, *configured]))
 
 
 @asynccontextmanager

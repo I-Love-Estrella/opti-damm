@@ -13,7 +13,7 @@ import {
 import TruckPanel from '@/components/TruckPanel';
 import CopilotPanel from '@/components/CopilotPanel';
 import MetricsBar from '@/components/MetricsBar';
-import WarehousePanel from '@/components/WarehousePanel';
+
 import { api, SIM_API_BASE } from '@/lib/api';
 
 const MapPanel = dynamic(() => import('@/components/MapPanel'), { ssr: false });
@@ -34,7 +34,6 @@ const INITIAL_LOG = [
 const SECTIONS = [
   { id: 'map', index: '01', title: 'Route' },
   { id: 'truck', index: '02', title: 'Load' },
-  { id: 'warehouse', index: '04', title: 'Warehouse' },
   { id: 'copilot', index: '03', title: 'Co-pilot' },
   { id: 'metrics', index: '—', title: 'Metrics' },
 ];
@@ -200,7 +199,7 @@ export default function Page() {
     return () => document.removeEventListener('mousedown', handler);
   }, [panelMenuOpen]);
 
-  const rightStackVisible = !collapsed.has('warehouse') || !collapsed.has('copilot');
+  const rightStackVisible = !collapsed.has('copilot');
 
   const panelGridStyle = useMemo(() => {
     const cols = [];
@@ -608,12 +607,6 @@ export default function Page() {
 
         {rightStackVisible && (
           <div className="right-stack">
-            {!collapsed.has('warehouse') && (
-              <Section id="warehouse" collapsed={false} fullscreen={fullscreenPanel === 'warehouse'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen} style={!collapsed.has('copilot') ? { flex: `0 0 ${rightSplit * 100}%` } : undefined}>
-                <WarehousePanel />
-                {!collapsed.has('copilot') && <DragHandle direction="vertical" onDrag={handleRightStackDrag} />}
-              </Section>
-            )}
             {!collapsed.has('copilot') && (
               <Section id="copilot" collapsed={false} fullscreen={fullscreenPanel === 'copilot'} onToggleCollapse={toggleCollapse} onToggleFullscreen={toggleFullscreen}>
                 <CopilotPanel

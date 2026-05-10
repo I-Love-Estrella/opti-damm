@@ -81,10 +81,22 @@ export function adaptPallets(apiResponse) {
         ret: false,
         client: null,
         wt: 0,
+        items: [],
       };
     }
     const items = p.items || [];
     const primaryItem = items.find((it) => it.intended_client === p.primary_client) || items[0];
+
+    const skuTotals = new Map();
+    for (const it of items) {
+      const code = shortSku(it.sku);
+      if (!code) continue;
+      skuTotals.set(code, (skuTotals.get(code) || 0) + it.qty);
+    }
+    const breakdown = Array.from(skuTotals.entries())
+      .map(([sku, qty]) => ({ sku, qty: Math.round(qty) }))
+      .sort((a, b) => b.qty - a.qty);
+
     return {
       idx,
       code: slot.slot_id,
@@ -93,6 +105,7 @@ export function adaptPallets(apiResponse) {
       ret: items.some((it) => it.is_returnable_empty),
       client: nameByClient.get(p.primary_client) || p.primary_client,
       wt: Math.round(p.weight_kg || 0),
+      items: breakdown,
     };
   });
 }

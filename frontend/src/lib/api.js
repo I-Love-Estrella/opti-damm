@@ -44,6 +44,33 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ algos, max_cases: maxCases, seed, min_clients: minClients }),
     }),
+  multiRun: ({ algo, cases, mode = 'first', n = 10, minClients = 5, seed = 42, truckCode }) =>
+    jsonRequest('/api/multi_run', {
+      method: 'POST',
+      body: JSON.stringify({
+        algo,
+        cases,
+        mode,
+        n,
+        min_clients: minClients,
+        seed,
+        truck_code: truckCode,
+      }),
+    }),
+  multiCompare: ({ algoA, algoB, cases, mode = 'first', n = 10, minClients = 5, seed = 42, truckCode }) =>
+    jsonRequest('/api/multi_compare', {
+      method: 'POST',
+      body: JSON.stringify({
+        algo_a: algoA,
+        algo_b: algoB,
+        cases,
+        mode,
+        n,
+        min_clients: minClients,
+        seed,
+        truck_code: truckCode,
+      }),
+    }),
   routes: () => jsonRequest('/routes'),
   routeDetail: (date, ruta) => jsonRequest(`/routes/${date}/${ruta}`),
   copilotChat: ({ message, messages = [], frontendContext = {} }) =>

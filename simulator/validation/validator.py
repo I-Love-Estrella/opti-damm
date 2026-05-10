@@ -321,32 +321,67 @@ def _check_process(case: DayCase, plan: Plan, result: SimulationResult) -> list[
         )
 
     # Overtime / legal limit.
-    hours = state.t_min / 60.0
-    if hours > OVERTIME_HARD_HOURS:
+    # The driver's shift = drive time + on-route service time.
+    # Warehouse loading (depot work) is performed by loaders, not the
+    # driver, and must NOT count toward the legal 13 h cap. We rebuild
+    # driver hours straight from the event log here so the validator
+    # stays self-contained (no dependency on the KPI module).
+    driver_hours = _driver_hours_from_log(result)
+    if driver_hours > OVERTIME_HARD_HOURS:
         out.append(
             ValidationIssue(
                 severity=ValidationSeverity.ERROR,
                 code="OVERTIME_LEGAL",
                 message=(
-                    f"Driver shift would last {hours:.1f}h — exceeds hard legal limit "
-                    f"({OVERTIME_HARD_HOURS:.0f}h)"
+                    f"Driver shift {driver_hours:.1f}h (drive + client service) — "
+                    f"exceeds hard legal limit ({OVERTIME_HARD_HOURS:.0f}h)"
                 ),
                 where="plan",
-                detail={"hours": round(hours, 2)},
+                detail={"driver_hours": round(driver_hours, 2)},
             )
         )
-    elif hours > OVERTIME_WARN_HOURS:
+    elif driver_hours > OVERTIME_WARN_HOURS:
         out.append(
             ValidationIssue(
                 severity=ValidationSeverity.WARNING,
                 code="OVERTIME_LONG_SHIFT",
-                message=f"Driver shift {hours:.1f}h — long; consider routing changes",
+                message=(
+                    f"Driver shift {driver_hours:.1f}h (drive + client service) — "
+                    f"long; consider routing changes"
+                ),
                 where="plan",
-                detail={"hours": round(hours, 2)},
+                detail={"driver_hours": round(driver_hours, 2)},
             )
         )
 
     return out
+
+
+_DRIVER_KINDS = frozenset({
+    "ARRIVE", "RETURN_DEPOT",                        # drive legs
+    "SERVICE_BASE", "UNLOAD", "PICKUP_RETURN",       # at-client service
+    "BLOCKER_LIFT", "TARGET_TAKE", "BLOCKER_REPLACE",
+    "DROP", "SETTLE",
+})
+
+
+def _driver_hours_from_log(result: SimulationResult) -> float:
+    """Total time the driver is on the clock, in hours.
+
+    Sums the time deltas between consecutive events whose kind is
+    something the driver performs: driving (ARRIVE / RETURN_DEPOT) or
+    at-client service. Depot loading events (BUILD_PALLET, PICK, LOAD,
+    DEPART_DEPOT) are excluded — those are warehouse loader work.
+    """
+
+    total = 0.0
+    prev_t = 0.0
+    for e in result.log.events:
+        delta = max(0.0, e.t_min - prev_t)
+        if e.kind in _DRIVER_KINDS:
+            total += delta
+        prev_t = e.t_min
+    return total / 60.0
 
 
 # ---------------------------------------------------------------------------

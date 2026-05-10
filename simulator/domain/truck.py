@@ -17,6 +17,24 @@ class Slot:
 
 def build_slots(spec: TruckSpec) -> tuple[Slot, ...]:
     cap = spec.pallet_capacity
+    sides = tuple(spec.sides)
+
+    # Back-loaded van (V3 has sides=("B",)): no side curtains, every
+    # pallet is reached through the rear doors. Lay them out as a
+    # single column B1..Bn along the truck length.
+    if sides == ("B",):
+        return tuple(
+            Slot(
+                slot_id=f"B{i + 1}",
+                side="B",
+                position=i + 1,
+                laterally_accessible=False,
+            )
+            for i in range(cap)
+        )
+
+    # Standard side-curtain truck (T6 / T8): L and R columns, plus an
+    # extra back-row B1 when capacity is odd.
     half = cap // 2
     slots: list[Slot] = []
     for i in range(half):

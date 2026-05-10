@@ -4,8 +4,10 @@ Endpoints
 ---------
 GET  /api/algorithms                          → list registered algorithms
 GET  /api/days?min_clients=5&head=20          → list available (date, ruta) cases
-POST /api/run    body: {date, ruta, algo}     → KPIs + plan summary for one run
-POST /api/bench  body: {algos, max_cases, seed}  → summary + head-to-head
+POST /api/run        body: {date, ruta, algo}                → KPIs + plan summary for one run
+POST /api/bench      body: {algos, max_cases, seed}          → summary + head-to-head
+POST /api/multi_run      body: {algo, mode|cases, n, min_clients}     → aggregate stats for one algo on N cases
+POST /api/multi_compare  body: {algo_a, algo_b, mode|cases, n, ...}   → paired head-to-head on the same N cases
 
 Run with:  python3 -m simulator.api  [--port 8000]
 """
@@ -21,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from simulator.algorithms import REGISTRY, get
+from simulator.bench.multi_compare import run_compare
+from simulator.bench.multi_run import CaseRef, run_multi
 from simulator.bench.runner import BenchConfig, run as bench_run
 from simulator.config import TRUCK_SPECS
 from simulator.core.simulator import Simulator
@@ -308,6 +312,7 @@ def _run_one(
         "kpis": kpi.to_dict(),
         "validation": validation.to_dict(),
         "physics_violations": physics_violations,
+        "placement_rejections": list(result.state.placement_rejections),
     }
 
 
@@ -519,6 +524,137 @@ def _build_stop_trace(records: list[dict], clients: Clients) -> dict[str, dict]:
     return out
 
 
+def _multi_run(body: dict) -> dict:
+    """Run a single algorithm against many (date, ruta) cases.
+
+    Body: {algo, mode?: "explicit"|"first"|"random"|"all", cases?, n?,
+           min_clients?, seed?, truck_code?}
+    """
+    algo = str(body.get("algo") or "")
+    if not algo:
+        raise ValueError("algo is required")
+    if algo not in REGISTRY:
+        raise ValueError(f"unknown algorithm: {algo}")
+
+    ctx = _ctx()
+    builder: DayCaseBuilder = ctx["builder"]  # type: ignore
+    clients_obj: Clients = ctx["clients"]  # type: ignore
+    network: Network = ctx["network"]  # type: ignore
+    sim: Simulator = ctx["sim"]  # type: ignore
+
+    truck_code_raw = body.get("truck_code")
+    truck_code = (
+        str(truck_code_raw).strip().upper() or None
+        if truck_code_raw is not None
+        else None
+    )
+
+    case_refs: list[CaseRef] | None = None
+    raw_cases = body.get("cases") or []
+    if raw_cases:
+        case_refs = []
+        for c in raw_cases:
+            if not isinstance(c, dict):
+                continue
+            d_raw = c.get("date")
+            r_raw = c.get("ruta")
+            if not d_raw or not r_raw:
+                continue
+            case_refs.append(
+                CaseRef(date=dt.date.fromisoformat(str(d_raw)), ruta=str(r_raw))
+            )
+
+    mode = str(body.get("mode") or "")
+    sample = None
+    if not case_refs:
+        sample = mode if mode in ("first", "random", "all") else "first"
+
+    n = int(body.get("n") or 10)
+    min_clients = int(body.get("min_clients") or 5)
+    seed = int(body.get("seed") or 42)
+
+    stats = run_multi(
+        algo,
+        cases=case_refs,
+        sample=sample,
+        n=n,
+        min_clients=min_clients,
+        seed=seed,
+        truck_code=truck_code,
+        builder=builder,
+        clients=clients_obj,
+        network=network,
+        sim=sim,
+    )
+    return stats.to_dict()
+
+
+def _multi_compare(body: dict) -> dict:
+    """Head-to-head: TWO algorithms on the SAME case set.
+
+    Body: {algo_a, algo_b, mode?: "first"|"random"|"all"|"explicit",
+           cases?, n?, min_clients?, seed?, truck_code?}
+    """
+    algo_a = str(body.get("algo_a") or "")
+    algo_b = str(body.get("algo_b") or "")
+    if not algo_a or not algo_b:
+        raise ValueError("algo_a and algo_b are required")
+    if algo_a not in REGISTRY:
+        raise ValueError(f"unknown algorithm: {algo_a}")
+    if algo_b not in REGISTRY:
+        raise ValueError(f"unknown algorithm: {algo_b}")
+    if algo_a == algo_b:
+        raise ValueError("algo_a and algo_b must differ")
+
+    ctx = _ctx()
+    builder: DayCaseBuilder = ctx["builder"]  # type: ignore
+    clients_obj: Clients = ctx["clients"]  # type: ignore
+    network: Network = ctx["network"]  # type: ignore
+    sim: Simulator = ctx["sim"]  # type: ignore
+
+    truck_code_raw = body.get("truck_code")
+    truck_code = (
+        str(truck_code_raw).strip().upper() or None
+        if truck_code_raw is not None
+        else None
+    )
+
+    case_refs: list[CaseRef] | None = None
+    raw_cases = body.get("cases") or []
+    if raw_cases:
+        case_refs = []
+        for c in raw_cases:
+            if not isinstance(c, dict):
+                continue
+            d_raw = c.get("date")
+            r_raw = c.get("ruta")
+            if not d_raw or not r_raw:
+                continue
+            case_refs.append(
+                CaseRef(date=dt.date.fromisoformat(str(d_raw)), ruta=str(r_raw))
+            )
+
+    mode = str(body.get("mode") or "")
+    sample = None
+    if not case_refs:
+        sample = mode if mode in ("first", "random", "all") else "first"
+
+    report = run_compare(
+        algo_a, algo_b,
+        cases=case_refs,
+        sample=sample,
+        n=int(body.get("n") or 10),
+        min_clients=int(body.get("min_clients") or 5),
+        seed=int(body.get("seed") or 42),
+        truck_code=truck_code,
+        builder=builder,
+        clients=clients_obj,
+        network=network,
+        sim=sim,
+    )
+    return report.to_dict()
+
+
 def _bench(algos: list[str], max_cases: int, seed: int, min_clients: int) -> dict:
     cfg = BenchConfig(
         algorithms=tuple(a for a in algos if a in REGISTRY),
@@ -635,6 +771,12 @@ class Handler(BaseHTTPRequestHandler):
                 seed = int(body.get("seed") or 42)
                 min_clients = int(body.get("min_clients") or 5)
                 self._json(200, _bench(list(algos), max_cases, seed, min_clients))
+                return
+            if url.path == "/api/multi_run":
+                self._json(200, _multi_run(body))
+                return
+            if url.path == "/api/multi_compare":
+                self._json(200, _multi_compare(body))
                 return
             self._json(404, {"error": "not found"})
         except Exception as exc:

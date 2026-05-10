@@ -45,8 +45,16 @@ function slotIndex(slotId) {
   return { side: m[1], pos: parseInt(m[2], 10) };
 }
 
-function slotWorldCenter(slotId, totalSidePos) {
+function slotWorldCenter(slotId, totalSidePos, backOnly = false) {
   const { side, pos } = slotIndex(slotId);
+  // Back-loaded van (V3): every slot is a B-slot in a single in-truck
+  // column, laid out along the X axis like normal lateral pallets.
+  if (backOnly) {
+    const totalLength = totalSidePos * (PALLET_LEN + SLOT_GAP_X);
+    const startX = -totalLength / 2 + (PALLET_LEN + SLOT_GAP_X) / 2;
+    const x = startX + (pos - 1) * (PALLET_LEN + SLOT_GAP_X);
+    return { x, y: 0, z: 0 };
+  }
   const totalLength = totalSidePos * (PALLET_LEN + SLOT_GAP_X);
   const startX = -totalLength / 2 + (PALLET_LEN + SLOT_GAP_X) / 2;
   const x = startX + (pos - 1) * (PALLET_LEN + SLOT_GAP_X);
@@ -223,9 +231,14 @@ function PalletPlatform({ center, side, layout, slotId }) {
   );
 }
 
-function TruckShell({ totalSidePos }) {
+function TruckShell({ totalSidePos, backOnly = false }) {
   const truckLength = totalSidePos * (PALLET_LEN + SLOT_GAP_X) + 2 * TRUCK_WALL_PAD;
-  const truckWidth = 2 * (PALLET_WIDTH + 0.05) + 2 * TRUCK_WALL_PAD;
+  // Back-loaded van (V3) has a single pallet column — narrow body.
+  // Standard side-curtain trucks (T6/T8) have two columns plus the
+  // 0.05 m gap on each side.
+  const truckWidth = backOnly
+    ? PALLET_WIDTH + 2 * TRUCK_WALL_PAD
+    : 2 * (PALLET_WIDTH + 0.05) + 2 * TRUCK_WALL_PAD;
   const truckHeight = PALLET_HEIGHT + 0.2;
 
   return (
@@ -333,22 +346,36 @@ export default function Truck3D({
     [boxes, activeId],
   );
 
+  // Back-loaded van: every available slot is a B-slot. The truck spec
+  // declares this via `sides=("B",)` (V3 in the Damm fleet). We detect
+  // it from the actual slot ids so the renderer stays decoupled from
+  // the spec format.
+  const backOnly = useMemo(() => {
+    const ids = Object.keys(palletsBySlot);
+    if (ids.length === 0) return (truck?.sides?.length === 1 && truck.sides[0] === 'B');
+    return ids.every((sid) => slotIndex(sid).side === 'B');
+  }, [palletsBySlot, truck]);
+
   const totalSidePos = useMemo(() => {
     let max = 0;
     for (const slotId of Object.keys(palletsBySlot)) {
       const { side, pos } = slotIndex(slotId);
-      if (side !== 'B' && pos > max) max = pos;
+      // Back-only trucks lay every pallet along the X axis; otherwise
+      // only L/R columns set the truck length and B sits behind.
+      if (backOnly || side !== 'B') {
+        if (pos > max) max = pos;
+      }
     }
     return Math.max(max, 1);
-  }, [palletsBySlot]);
+  }, [palletsBySlot, backOnly]);
 
   const slotCenters = useMemo(() => {
     const out = {};
     for (const slotId of Object.keys(palletsBySlot)) {
-      out[slotId] = slotWorldCenter(slotId, totalSidePos);
+      out[slotId] = slotWorldCenter(slotId, totalSidePos, backOnly);
     }
     return out;
-  }, [palletsBySlot, totalSidePos]);
+  }, [palletsBySlot, totalSidePos, backOnly]);
 
   // In-hands cargo: group identical items so the row above the truck doesn't
   // turn into a jittered cloud. Key = type + full/empty + client + sku, so
@@ -417,7 +444,7 @@ export default function Truck3D({
           <directionalLight position={[6, 8, 4]} intensity={1.0} />
           <directionalLight position={[-6, 6, -4]} intensity={0.4} color="#88aaff" />
 
-          <TruckShell totalSidePos={totalSidePos} />
+          <TruckShell totalSidePos={totalSidePos} backOnly={backOnly} />
 
           {Object.entries(palletsBySlot).map(([slotId, meta]) => (
             <PalletPlatform

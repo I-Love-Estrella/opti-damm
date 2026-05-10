@@ -54,6 +54,7 @@ class Simulator:
         tariffs: Tariffs = DEFAULT_TARIFFS,
         time_model: TimeModel = DEFAULT_TIME_MODEL,
         strict_physics: bool = False,
+        reject_invalid_placement: bool = True,
     ):
         self._clients = clients
         self._network = network or Network(time_model)
@@ -63,6 +64,16 @@ class Simulator:
         # overlap. When False (default) those become capacity_violations
         # and the run continues so we can still see KPIs.
         self._strict_physics = strict_physics
+        # When True (default) the simulator REFUSES to place an item
+        # whose algorithm-supplied position would overlap, float, or
+        # fall outside the pallet. The item is recorded in
+        # `state.placement_rejections` and reported via KPI
+        # `placement_rejections`/`lost_units` — i.e. "we tried but
+        # couldn't, the unit is lost".
+        # When False the legacy behaviour kicks in: the simulator runs a
+        # defensive snap pass to find a clean spot and emits a warning
+        # PHYSICS_VIOLATION instead.
+        self._reject_invalid_placement = reject_invalid_placement
 
     def run(self, case: DayCase, plan: Plan) -> SimulationResult:
         state = WorldState.from_case(case)
@@ -307,12 +318,13 @@ class Simulator:
         moves = sum(b.stack_size for b in blockers)
         st.search_moves += moves
 
-        per_box_lift = self._tm.service_min_per_search_move / 2.0
-        per_box_replace = self._tm.service_min_per_search_move / 2.0
-
         # Phase 1: lift each blocker box-by-box. Top of each blocker stack
-        # comes off first (highest level → lowest level).
+        # comes off first (highest level → lowest level). Per-unit lift
+        # time scales with physical type (a keg takes much longer than a
+        # can) — see TimeModel.handle_min.
         for b in blockers:
+            per_box_lift = self._tm.handle_min(b.physical_type) * 0.5
+            per_box_replace = per_box_lift
             same_col = b.col_x == target.col_x and b.col_y == target.col_y
             reason_text = (
                 "in target column above target" if same_col else "in stack closer to truck edge"
@@ -360,11 +372,12 @@ class Simulator:
             st.delivered_qty.get((cmd.client_id, cmd.sku), 0.0) + actual_qty
         )
 
-        # Phase 2: take target box-by-box (top → bottom). Total time stays
-        # service_min_per_pallet, split across actual_qty units.
-        take_total_min = self._tm.service_min_per_pallet
+        # Phase 2: take target box-by-box (top → bottom). Per-unit time
+        # is type-driven (a keg unit takes much longer than a can) — no
+        # longer divides a fixed pallet-budget across units, since that
+        # made big orders artificially "cheap per box".
         target_units = max(1, int(round(actual_qty)))
-        per_unit_take = take_total_min / target_units
+        per_unit_take = self._tm.handle_min(target.physical_type)
         target_top = target.bottom_level + target.stack_size - 1
         slice_h = (target.dim_h / target.stack_size) if target.stack_size > 0 else target.dim_h
         for u in range(target_units):
@@ -404,6 +417,7 @@ class Simulator:
         # Phase 3: replace blockers in reverse-of-lift LIFO order. Within each
         # blocker, replay bottom → top (rebuild the original stack).
         for b in reversed(blockers):
+            per_box_replace = self._tm.handle_min(b.physical_type) * 0.5
             slice_h = (b.dim_h / b.stack_size) if b.stack_size > 0 else b.dim_h
             for unit in range(b.stack_size):
                 level = b.bottom_level + unit
@@ -475,23 +489,77 @@ class Simulator:
         if cmd.pos_z + cmd.dim_h > 1.80 + 0.01:
             st.capacity_violations += 1
 
-        # Defensive snap: if the algorithm-supplied position would
-        # (a) collide with an existing item, or (b) float in mid-air
-        # with nothing supporting it, find a clean anchor instead.
-        # Counts as a capacity_violation and prints a warning so the
-        # algorithm bug stays visible — but the visualizer never
-        # shows two items occupying the same volume or a keg
-        # hovering. As a last resort the height constraint is
-        # dropped (an over-tall stack is the lesser evil); if even
-        # that fails we drop the empty.
+        # Validate the algorithm-supplied position against the pallet's
+        # current state: does it overlap a live item, float in mid-air,
+        # or sit outside the pallet footprint?
         pos_x, pos_y, pos_z = cmd.pos_x, cmd.pos_y, cmd.pos_z
+        oob_xy = (
+            pos_x < -_PHYSICS_EPS
+            or pos_y < -_PHYSICS_EPS
+            or pos_x + cmd.dim_x > _PALLET_LENGTH_M + _PHYSICS_EPS
+            or pos_y + cmd.dim_y > _PALLET_WIDTH_M + _PHYSICS_EPS
+        )
         would_collide = _aabb_collides_with_pallet(
             pos_x, pos_y, pos_z, cmd.dim_x, cmd.dim_y, cmd.dim_h, pallet
         )
         would_float = not _has_support(
             pos_x, pos_y, pos_z, cmd.dim_x, cmd.dim_y, pallet
         )
-        if would_collide or would_float:
+        if oob_xy or would_collide or would_float:
+            reason_parts: list[str] = []
+            if oob_xy:
+                reason_parts.append("out of bounds")
+            if would_collide:
+                reason_parts.append("overlap")
+            if would_float:
+                reason_parts.append("floating")
+            reason = " + ".join(reason_parts) or "invalid"
+
+            if self._reject_invalid_placement:
+                # User-requested behaviour: do NOT snap. Refuse the
+                # placement, record the lost unit(s), keep going.
+                _print_violation(
+                    f"PHYSICS [PickupReturn {cmd.sku}@{cmd.slot_id}]: "
+                    f"REJECTED — {reason} at "
+                    f"({pos_x:.3f},{pos_y:.3f},{pos_z:.3f}); {cmd.qty:g} unit(s) lost"
+                )
+                rejection = {
+                    "kind": "PickupReturn",
+                    "slot_id": cmd.slot_id,
+                    "sku": cmd.sku,
+                    "qty": float(cmd.qty),
+                    "reason": reason,
+                    "pos": [float(pos_x), float(pos_y), float(pos_z)],
+                    "dims": [float(cmd.dim_x), float(cmd.dim_y), float(cmd.dim_h)],
+                    "physical_type": cmd.physical_type,
+                    "client_id": cmd.client_id,
+                    "t_min": float(st.t_min),
+                }
+                st.placement_rejections.append(rejection)
+                log.emit(
+                    st.t_min,
+                    "PLACEMENT_REJECTED",
+                    code="PICKUP_REJECTED",
+                    message=(
+                        f"PickupReturn refused: {cmd.sku}@{cmd.slot_id} "
+                        f"requested ({pos_x:.3f},{pos_y:.3f},{pos_z:.3f}) — "
+                        f"{reason}; {cmd.qty:g} unit(s) lost"
+                    ),
+                    where="PickupReturn",
+                    slot_id=cmd.slot_id,
+                    sku=cmd.sku,
+                    qty=float(cmd.qty),
+                    reason=reason,
+                    pos=[pos_x, pos_y, pos_z],
+                    physical_type=cmd.physical_type,
+                    client_id=cmd.client_id,
+                )
+                # Still spend a token amount of time — driver tried,
+                # then put the empty back on the dock.
+                st.t_min += self._tm.pickup_setup_min
+                return
+
+            # Legacy behaviour: snap to a clean anchor.
             new_pos = _find_clean_position(
                 pallet, cmd.dim_x, cmd.dim_y, cmd.dim_h
             )
@@ -501,9 +569,6 @@ class Simulator:
                     enforce_pallet_height=False,
                 )
             if new_pos is None:
-                # No clean spot anywhere on this pallet — refuse rather
-                # than render an overlap. The validator surfaces this as
-                # OVERLAP / dropped returnable.
                 _print_violation(
                     f"PHYSICS [PickupReturn {cmd.sku}@{cmd.slot_id}]: "
                     f"no clean position for empty at "
@@ -524,7 +589,7 @@ class Simulator:
                     pos=[pos_x, pos_y, pos_z],
                 )
                 st.capacity_violations += 1
-                st.t_min += 0.5 + 0.05 * cmd.qty
+                st.t_min += self._tm.pickup_setup_min + self._tm.handle_min(cmd.physical_type) * cmd.qty
                 return
             _print_violation(
                 f"PHYSICS [PickupReturn {cmd.sku}@{cmd.slot_id}]: "
@@ -567,7 +632,7 @@ class Simulator:
         st.picked_returns[(cmd.client_id, cmd.sku)] = (
             st.picked_returns.get((cmd.client_id, cmd.sku), 0.0) + cmd.qty
         )
-        st.t_min += 0.5 + 0.05 * cmd.qty
+        st.t_min += self._tm.pickup_setup_min + self._tm.handle_min(cmd.physical_type) * cmd.qty
         # Carry the ACTUAL placed position (after any defensive snap)
         # in the event so the frontend renders the keg where the
         # simulator put it. Without these, the frontend defaulted to
@@ -771,11 +836,11 @@ class Simulator:
         moves = sum(b.stack_size for b in lift_order)
         st.search_moves += moves
 
-        per_box_lift = self._tm.service_min_per_search_move / 2.0
-        per_box_replace = self._tm.service_min_per_search_move / 2.0
-
         # Phase 1: lift everything in the way (foreign + same-client).
+        # Per-unit lift cost depends on the blocker's physical type — a
+        # heavy keg is materially slower to move than a single can.
         for b in lift_order:
+            per_box_lift = self._tm.handle_min(b.physical_type) * 0.5
             will_be_delivered = b.intended_client == client_id
             slice_h = (b.dim_h / b.stack_size) if b.stack_size > 0 else b.dim_h
             for unit in range(b.stack_size - 1, -1, -1):
@@ -924,14 +989,67 @@ class Simulator:
                 if cur_pallet is not None:
                     cur_pallet, removed = cur_pallet.remove_specific(b)
                     if removed is not None:
-                        # Defensive snap — if the algorithm asked us to
-                        # restock the blocker into a spot that's already
-                        # occupied by another item, find a clean anchor
-                        # so we never produce visible overlap.
                         if _aabb_collides_with_pallet(
                             target_pos_x, target_pos_y, target_pos_z,
                             b.dim_x, b.dim_y, b.dim_h, cur_pallet,
                         ):
+                            if self._reject_invalid_placement:
+                                # User-requested behaviour: refuse to put
+                                # the lifted blocker back into a colliding
+                                # spot. The blocker is lost (we couldn't
+                                # find anywhere safe to set it down).
+                                _print_violation(
+                                    f"PHYSICS [restock {b.sku}@{slot_id}]: "
+                                    f"REJECTED — overlap at "
+                                    f"({target_pos_x:.3f},{target_pos_y:.3f},{target_pos_z:.3f}); "
+                                    f"{b.qty:g} unit(s) lost"
+                                )
+                                rejection = {
+                                    "kind": "Restock",
+                                    "slot_id": slot_id,
+                                    "sku": b.sku,
+                                    "qty": float(b.qty),
+                                    "reason": "overlap",
+                                    "pos": [
+                                        float(target_pos_x),
+                                        float(target_pos_y),
+                                        float(target_pos_z),
+                                    ],
+                                    "dims": [
+                                        float(b.dim_x),
+                                        float(b.dim_y),
+                                        float(b.dim_h),
+                                    ],
+                                    "physical_type": getattr(
+                                        b, "physical_type", "unit"
+                                    ),
+                                    "client_id": b.intended_client,
+                                    "t_min": float(st.t_min),
+                                }
+                                st.placement_rejections.append(rejection)
+                                log.emit(
+                                    st.t_min,
+                                    "PLACEMENT_REJECTED",
+                                    code="RESTOCK_REJECTED",
+                                    message=(
+                                        f"Restock refused: blocker {b.sku} "
+                                        f"target ({target_pos_x:.3f},"
+                                        f"{target_pos_y:.3f},"
+                                        f"{target_pos_z:.3f}) overlaps; "
+                                        f"{b.qty:g} unit(s) lost"
+                                    ),
+                                    where="restock",
+                                    slot_id=slot_id,
+                                    sku=b.sku,
+                                    qty=float(b.qty),
+                                    reason="overlap",
+                                    pos=[target_pos_x, target_pos_y, target_pos_z],
+                                )
+                                # Persist the cur_pallet without `b` and
+                                # skip the rest of the restock loop body
+                                # for this blocker.
+                                st.cargo.pallet_by_id[cur_pallet.pallet_id] = cur_pallet
+                                continue
                             snapped = _find_clean_position(
                                 cur_pallet, b.dim_x, b.dim_y, b.dim_h
                             )
@@ -982,6 +1100,7 @@ class Simulator:
                         cur_pallet = cur_pallet.add_item(moved)
                         st.cargo.pallet_by_id[cur_pallet.pallet_id] = cur_pallet
 
+            per_box_replace = self._tm.handle_min(b.physical_type) * 0.5
             slice_h = (b.dim_h / b.stack_size) if b.stack_size > 0 else b.dim_h
             for unit in range(b.stack_size):
                 level = b.bottom_level + unit
@@ -1088,9 +1207,29 @@ class Simulator:
             )
             return
 
-        new_pallet, removed = current_pallet.remove_item(cmd_sku, cmd_qty, client_id)
+        # Take from the SPECIFIC `item_for_log` (resolved by id earlier
+        # in `_unload_slot_batch`). Going through `remove_item(sku, qty,
+        # client)` instead would pick the FIRST matching item — and if
+        # the algorithm packed a client's SKU into multiple chunks (e.g.
+        # qty=3 → chunks of 2 + 1), the cmd's qty wouldn't line up with
+        # whichever item it grabbed: a qty=2 command landing on the
+        # qty=1 chunk would deliver 1 and leave the qty=2 chunk
+        # untouched, hovering after subsequent deliveries.
+        new_pallet, removed = _consume_specific(
+            current_pallet, item_for_log, cmd_qty
+        )
         if removed is None:
-            new_pallet, removed = current_pallet.remove_item(cmd_sku, cmd_qty, None)
+            # The picked target was already gone (e.g. consumed as a
+            # same-client opportunistic earlier in the batch). Fall back
+            # to the by-key lookup so the qty still finds something to
+            # take from when possible.
+            new_pallet, removed = current_pallet.remove_item(
+                cmd_sku, cmd_qty, client_id
+            )
+            if removed is None:
+                new_pallet, removed = current_pallet.remove_item(
+                    cmd_sku, cmd_qty, None
+                )
         if removed is None:
             st.drops.append((client_id, cmd_sku, cmd_qty))
             log.emit(
@@ -1110,7 +1249,9 @@ class Simulator:
         )
 
         target_units = max(1, int(round(actual_qty)))
-        per_unit_take = self._tm.service_min_per_pallet / target_units
+        # Per-unit handing time depends on the item's physical type
+        # (kegs, cases, bottles and cans aren't equivalent work).
+        per_unit_take = self._tm.handle_min(item_for_log.physical_type)
         target_top = item_for_log.bottom_level + item_for_log.stack_size - 1
         # Driver takes the top unit first, then works downward — match
         # the per-cube pos_z so the frontend marks the correct visible
@@ -1319,6 +1460,70 @@ def _print_violation(msg: str) -> None:
     in server logs alongside the EventLog entry. Operators see
     failures even if they ignore the structured response."""
     print(f"[PHYSICS] {msg}", file=sys.stderr)
+
+
+def _consume_specific(pallet, target, qty: float):
+    """Take up to `qty` units from the SPECIFIC `target` PalletItem
+    (matched by Python identity). Returns `(new_pallet, removed)` —
+    `removed` is a synthetic PalletItem describing what came off
+    (preserving SKU / dims / pos for the TARGET_TAKE event), or None
+    if `target` is no longer on the pallet.
+
+    Why not `pallet.remove_item(sku, qty, client)`: that walks items by
+    (sku, client) and consumes the FIRST match only, stopping after one
+    item even if `qty` exceeds it. When an algorithm packs the same
+    (sku, client) into multiple chunks (e.g. qty=3 → [qty=2, qty=1]),
+    the per-Unload qty needs to match the SPECIFIC chunk it referred
+    to. Going through identity guarantees that.
+    """
+    if qty <= 0 or target is None:
+        return pallet, None
+    items = pallet.items
+    new_items: list = []
+    removed = None
+    for it in items:
+        if removed is None and it is target and it.qty > 0:
+            take = min(it.qty, qty)
+            if take >= it.qty - 1e-9:
+                # Fully consumed — drop it.
+                removed = it
+                continue
+            kept_qty = it.qty - take
+            ratio = kept_qty / it.qty if it.qty > 0 else 0.0
+            kept = type(it)(
+                sku=it.sku,
+                qty=kept_qty,
+                unit_volume_m3=it.unit_volume_m3,
+                unit_weight_kg=it.unit_weight_kg,
+                intended_client=it.intended_client,
+                is_returnable_empty=it.is_returnable_empty,
+                physical_type=it.physical_type,
+                pos_x=it.pos_x,
+                pos_y=it.pos_y,
+                pos_z=it.pos_z,
+                dim_x=it.dim_x,
+                dim_y=it.dim_y,
+                dim_h=it.dim_h * ratio,
+            )
+            removed = type(it)(
+                sku=it.sku,
+                qty=take,
+                unit_volume_m3=it.unit_volume_m3,
+                unit_weight_kg=it.unit_weight_kg,
+                intended_client=it.intended_client,
+                is_returnable_empty=it.is_returnable_empty,
+                physical_type=it.physical_type,
+                pos_x=it.pos_x,
+                pos_y=it.pos_y,
+                pos_z=it.pos_z + kept.dim_h,
+                dim_x=it.dim_x,
+                dim_y=it.dim_y,
+                dim_h=it.dim_h - kept.dim_h,
+            )
+            new_items.append(kept)
+            continue
+        new_items.append(it)
+    return pallet.with_items(tuple(new_items)), removed
 
 
 def _aabb_collides_with_pallet(

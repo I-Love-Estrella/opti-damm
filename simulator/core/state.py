@@ -60,6 +60,11 @@ class WorldState:
     closed_visits: int = 0
     capacity_violations: int = 0
     drops: list[tuple[str, str, float]] = field(default_factory=list)
+    # Items the simulator REJECTED placing because the algorithm-supplied
+    # position would overlap, float, or fall outside the pallet. Each
+    # entry is a structured dict (kind, slot_id, sku, qty, reason, pos).
+    # Surfaced as KPI `placement_rejections` and `lost_units`.
+    placement_rejections: list[dict] = field(default_factory=list)
     finalized: bool = False
 
     @classmethod

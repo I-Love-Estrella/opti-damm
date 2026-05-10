@@ -1,41 +1,43 @@
-"""Historic mimic — Damm's current load-by-reference + driver-route practice.
+"""Historic — Damm's actual driver route + client-block, search-move-aware loading.
 
-This is the algorithm a real DDI Mollet driver/loader pair runs today,
-captured as faithfully as the simulator's physics will allow:
+The driver route is preserved verbatim from the source delivery notes
+(no NN / 2-opt reordering); the loader is the single piece we optimise
+to make the day deliverable inside legal physics + minimal lift cycles.
 
-  - **Route**: ACTUAL driver visit sequence from the source `Detalle
-    entrega` (preserved in `case.orders`). No NN/2-opt reordering — we
-    want to score what they really did, not a rerouted version.
-  - **Loading: load-by-reference (SKU-block)**. The warehouse picking
-    sheet (Hoja Carga) is grouped by warehouse zone / SKU, so units of
-    the same SKU stay together on a pallet whenever they fit, even
-    across customers. This is the killer warehouse-friendly pattern,
-    and it is also the killer search-move generator at delivery.
-  - **Pallet class discipline**: KEG and BOX never share a pallet
-    (validator's CRUSH_RISK + GLASS_UNDER_HEAVY rules).
-  - **Slot assignment mirrors visit order**: the pallet whose primary
-    client is the first visit lands on the door-side slot (L1 / R1);
+  - **Route**: ACTUAL visit sequence from `Detalle entrega` (`case.orders`).
+  - **Loading — CLIENT-BLOCK** (NOT pure load-by-reference): all chunks
+    for one client are emitted consecutively so the natural lowest-(z, y, x)
+    packer puts each client's items in a contiguous block on the truck.
+    Same-coloured cubes stay together, the driver opens the curtain
+    onto exactly one client's stuff per stop.
+      * Across clients: EARLIEST-visit client first → takes the door-
+        edge anchors at low (y, x). Stop 1 needs no lift cycles.
+      * Within a client: HEAVIEST SKU first → lands at z=0 (avoids
+        CRUSH_RISK = a 35 kg keg sitting on a 1 kg case).
+  - **Pallet class discipline**: KEG and BOX never share a pallet —
+    keeps GLASS_UNDER_HEAVY / CRUSH_RISK clean.
+  - **Per-class slot quota**: KEG and BOX claim slots proportional to
+    their total chunk volume, so a few keg SKUs with awkward dims can't
+    eat 5/6 slots and starve the box-class delivery.
+  - **Slot assignment mirrors visit order**: the pallet whose earliest
+    client is visited soonest lands on the door-side slot (L1 / R1);
     the last-visited primary client goes to the back-most slot. KEG
-    pallets are clustered toward the back so the floor stays free for
-    empties on the door-side.
+    pallets cluster toward the back so the door-side floor stays free
+    for empties pickup.
 
-Geometry-wise we reuse the `_find_position_safe` tiering pattern from
-the balanced loader so every Pick lands at a strictly valid anchor when
-possible, and degrades gracefully (with a tier penalty) only when the
-strict anchor doesn't exist. That alone is enough to clear the
-FLOATING / OVERHANG / OVERLAP errors that the literal `replay` baseline
-trips on.
+Geometry uses a single strict tier in `_find_position_safe` (≥ 50 %
+support, no crush, aspect-stable). Anything that doesn't fit there
+overflows to a fresh pallet within the per-class quota; if even that
+fails, the chunk is dropped (no UNSTABLE_OVERHANG / CRUSH_RISK ever
+emitted, by construction).
 
-Returnables go on the floor of a KEG-compatible slot via the
-`BalancedStrategy` so the truck COG stays near (0.52, 0.50). When no
-keg slot has floor space, the strategy degrades to any slot with a
-clean floor, then to a stable empties-on-empties stack — never on top
-of a foreign client's cargo.
+Returnables (kegs / crates / bottles per the Damm brief — three return
+categories) go on the floor of class-compatible slots via the strict
+`_FloorOnlyEmptiesStrategy` (never stacked on cargo).
 
-Why this matters: it gives the team a faithful baseline for "what we'd
-get if we just made the existing process physically valid". Comparing
-`historic` against `balanced` / `lifo` / `nearest` then shows the real
-upside of route reordering vs better packing in isolation.
+Why historic vs balanced: `balanced` re-routes via NN + 2-opt; historic
+keeps the human driver's choice and only fixes the loading. Comparing
+the two isolates "route savings" from "loader savings".
 """
 
 from __future__ import annotations
@@ -127,6 +129,12 @@ def _line_class(line: OrderLine) -> PalletClass:
 
 
 def _stack_chunk_qty(qty: float, dx: float, dy: float, dh: float, *, is_keg: bool) -> float:
+    # Maximise items per chunk. Each Pick command costs the loader a
+    # fixed `pick_min_per_sku` (2 min) regardless of qty, so splitting
+    # the same SKU into many small chunks blows up depot loading time.
+    # Kegs cap at the KEG_MAX_STACK=2 business rule. Other items cap at
+    # the stability-aspect ratio AND the pallet height ceiling — both
+    # already enforced by the validator.
     if is_keg:
         return float(min(qty, KEG_MAX_STACK))
     narrow = max(1e-3, min(dx, dy))
@@ -142,42 +150,31 @@ def _find_position_safe(
     stack_h: float,
     unit_weight_kg: float,
 ) -> tuple[tuple[float, float, float] | None, int]:
-    """Tiered packer: strict valid anchor first, degrade only when forced.
+    """Strict packer: ≥ 50 % support coverage, no crush, aspect-stable.
 
-    Tier 1 — strict (≥50% support, no crush, aspect-stable).
-    Tier 2 — allow crush (rare unit-weight inversion).
-    Tier 3 — accept any anchor with strictly positive support, prefer max-support.
-    Tier 4 — relaxed (drop aspect rule), prefer max-support.
-    Returns (pos, tier). Tier is used by the slot scorer to penalise
-    degraded fits, so the algorithm prefers slots where the strict
-    anchor exists.
+    Returns (pos, 1) on success, (None, 0) on failure. We deliberately
+    have no relaxed fallback:
+      - Lower support fraction trips UNSTABLE_OVERHANG (validator).
+      - Allowing crush trips CRUSH_RISK (validator) — that turns the
+        "early clients at the door edge" sort into a CRUSH disaster
+        when a heavy case ends up on top of a light unit.
+    Chunks that don't fit overflow and the caller opens a fresh pallet
+    (subject to the per-class quota) or drops the chunk.
     """
 
-    base = dict(
+    pos = find_position(
+        items,
         dim_x=dim_x,
         dim_y=dim_y,
         dim_h=stack_h,
         enforce_pallet_height=True,
         aspect_limit=STACK_RATIO,
         unit_weight_kg=unit_weight_kg,
+        require_support=True,
+        avoid_crush=True,
     )
-    pos = find_position(items, **base, require_support=True, avoid_crush=True)
     if pos is not None:
         return pos, 1
-    pos = find_position(items, **base, require_support=True, avoid_crush=False)
-    if pos is not None:
-        return pos, 2
-    pos = find_position(
-        items, **base,
-        require_support=True,
-        min_support_fraction=0.001,
-        prefer_max_support=True,
-    )
-    if pos is not None:
-        return pos, 3
-    # Tier 4 dropped on purpose. Anything that doesn't fit at tiers 1-3
-    # becomes overflow and forces a fresh pallet — better than emitting
-    # an OVERHANG / STACK_UNSTABLE that the validator rejects.
     return None, 0
 
 
@@ -253,24 +250,46 @@ class _PalletDraft:
 class HistoricMimic(Algorithm):
     name = "historic"
     description = (
-        "Mimics current Damm practice: actual driver visit order + load-by-"
-        "reference (SKU-block) packing, with strict 3D physics so the plan "
-        "is physically valid. KEG and BOX kept on separate pallets; door-"
-        "side slot reserved for the first-visited client's pallet."
+        "Driver's actual visit order (no rerouting) + client-block loading: "
+        "each client's items pack together so the curtain opens onto one "
+        "stop at a time, no rummaging. KEG and BOX on separate pallets, "
+        "per-class slot quota, strict no-crush / no-overhang physics."
     )
 
     def plan(self, case: DayCase, clients: Clients, network: Network) -> Plan:
         rationale: list[str] = []
 
-        # Route: keep historic Entrega sequence verbatim.
-        route = list(case.orders)
+        # Two routes: one drives the warehouse load (chunk ordering, slot
+        # assignment); one drives the actual driving sequence on the road.
+        # Historic mimic uses the same historic sequence for both.
+        # Subclasses (e.g. HistoricLoad) override `_delivery_route` to
+        # re-optimize the on-road order while keeping the warehouse load
+        # exactly as Damm does it today.
+        loading_route = self._loading_route(case, clients, network)
         rationale.append(
-            "Route: actual driver visit order from Detalle entrega "
-            f"(seq: {[o.client_id for o in route]})."
+            "Loading-side visit order (warehouse plan): "
+            f"{[o.client_id for o in loading_route]}."
         )
 
         slots = list(build_slots(case.truck))
-        visit_seq = {o.client_id: idx for idx, o in enumerate(route)}
+        # visit_seq drives slot assignment (earliest-visit primary near
+        # the door) — anchored to the loading route, since slot
+        # assignment is part of how the warehouse stages the truck.
+        visit_seq = {o.client_id: idx for idx, o in enumerate(loading_route)}
+        route = loading_route
+
+        # delivery_seq drives chunk packing (LATE-delivery clients land
+        # on the bottom, EARLY-delivery on top) so unloads come off
+        # top-to-bottom and never leave a chunk floating after a delivery.
+        # Computed up-front from the (possibly re-optimized) on-road
+        # route — for HistoricLoad this differs from loading_route after
+        # NN/2-opt/or-opt; for plain Historic they're identical.
+        delivery_route_pre = self._delivery_route(
+            case, clients, network, loading_route
+        )
+        delivery_seq = {
+            o.client_id: idx for idx, o in enumerate(delivery_route_pre)
+        }
 
         # Build per-class SKU blocks. Each SKU collects (client, qty)
         # demands from all clients that ordered it; chunks are emitted
@@ -315,14 +334,18 @@ class HistoricMimic(Algorithm):
                     sku_first_seq.setdefault(line.sku, line_seq)
                     remaining -= take
 
-        # Sort chunks SKU-block first (load-by-reference), HEAVIEST PER-UNIT
-        # SKUs first so they land on the pallet floor (avoids CRUSH_RISK
-        # where a 35 kg keg ends up sitting on a 1 kg bottle).
-        # Within an SKU, LATER-route clients first — they take the low
-        # (z, y, x) positions, leaving earlier-route clients on top.
-        # When an earlier client is unloaded first, removing their stack
-        # doesn't disturb the later client below — FLOATING_ITEM events
-        # drop dramatically.
+        # LIFO-safe client-block sort. The greedy packer fills the
+        # lowest (z, y, x) anchor first, so whichever chunk we hand it
+        # FIRST lands at z=0. To keep every chunk supported through the
+        # whole route we therefore want:
+        #   1. LATEST-delivery client first → lands on the floor;
+        #      delivered last, so nothing above ever loses its support.
+        #   2. Within a client, HEAVY SKU first → keg-on-bottle CRUSH
+        #      stays impossible.
+        # Same-client cubes still pack consecutively (one client → one
+        # contiguous block in the visualiser). Pure load-by-reference
+        # scattered each client across many SKU groups, which is why
+        # historic_replay generated huge search-move counts.
         sku_max_weight: dict[str, float] = defaultdict(float)
         for cls_chunks in chunks_by_class.values():
             for c in cls_chunks:
@@ -331,11 +354,8 @@ class HistoricMimic(Algorithm):
 
         for cls in (PalletClass.KEG, PalletClass.BOX):
             chunks_by_class[cls].sort(
-                key=lambda c: (
-                    -sku_max_weight[c.sku],
-                    -sku_total_volume[c.sku],
-                    c.sku,
-                    -visit_seq[c.client_id],  # LATER client first
+                key=lambda c: self._chunk_sort_key(
+                    c, sku_max_weight, sku_total_volume, delivery_seq
                 )
             )
 
@@ -352,15 +372,31 @@ class HistoricMimic(Algorithm):
             drafts.append(d)
             return d
 
-        # Pack each class: keep current SKU block flowing onto current
-        # pallet until the chunk no longer fits, then open a new pallet.
-        # If we run out of slots, fall back to the most-recent compatible
-        # pallet that still has room (same load-by-reference intent).
+        # Pre-allocate slot quota per class proportional to total volume.
+        # Without this, a few keg SKUs with awkward dimensions (e.g. ED30
+        # 0.408 m wide → only 1 Y-column fits on the 0.80 m pallet width)
+        # eat 5/6 slots, leaving BOX-class units to massively overflow.
         max_pallets = len(slots)
+        vol_by_class: dict[PalletClass, float] = {
+            PalletClass.KEG: sum(
+                c.unit_dim_x * c.unit_dim_y * c.stack_h
+                for c in chunks_by_class[PalletClass.KEG]
+            ),
+            PalletClass.BOX: sum(
+                c.unit_dim_x * c.unit_dim_y * c.stack_h
+                for c in chunks_by_class[PalletClass.BOX]
+            ),
+        }
+        slot_quota = self._split_slot_quota(vol_by_class, max_pallets)
         overflow: list[tuple[str, str, float]] = []
 
         for cls in (PalletClass.KEG, PalletClass.BOX):
             current: _PalletDraft | None = None
+            cls_quota = slot_quota.get(cls, 0)
+
+            def cls_pallet_count() -> int:
+                return sum(1 for d in drafts if d.pallet_class == cls)
+
             for chunk in chunks_by_class[cls]:
                 placed = False
 
@@ -374,35 +410,21 @@ class HistoricMimic(Algorithm):
                         chunk.stack_h,
                         chunk.unit_weight_kg,
                     )
-                    if pos is None or tier > 2:
-                        return None
-                    if not self._column_ok(draft.items, pos, chunk):
-                        return None
-                    if not self._lifo_ok(draft.items, pos, chunk, visit_seq):
-                        return None
-                    return pos
-
-                def try_any_tier(draft: _PalletDraft) -> tuple[
-                    int, tuple[float, float, float]
-                ] | None:
-                    if draft.weight_kg + chunk.weight_kg > PALLET_MAX_WEIGHT_KG:
-                        return None
-                    pos, tier = _find_position_safe(
-                        draft.items,
-                        chunk.unit_dim_x,
-                        chunk.unit_dim_y,
-                        chunk.stack_h,
-                        chunk.unit_weight_kg,
-                    )
                     if pos is None:
                         return None
                     if not self._column_ok(draft.items, pos, chunk):
                         return None
-                    if not self._lifo_ok(draft.items, pos, chunk, visit_seq):
+                    # LIFO guard: refuse anchors where the supporter
+                    # column belongs to a client delivered EARLIER than
+                    # this chunk's client. Otherwise the early delivery
+                    # would yank our supporter out from under us
+                    # mid-route → SETTLE / FLOATING events.
+                    if not self._lifo_ok(draft.items, pos, chunk, delivery_seq):
                         return None
-                    return tier, pos
+                    return pos
 
                 # 1. Strict tier on the current SKU-block pallet, if not soft-full.
+                #    Preserves load-by-reference continuity within an SKU.
                 if (
                     current is not None
                     and current.pallet_class == cls
@@ -413,21 +435,12 @@ class HistoricMimic(Algorithm):
                         self._commit(current, chunk, pos, delivery_slots)
                         placed = True
 
-                # 2. Strict tier on a fresh pallet (preserves clean geometry).
-                if not placed and len(drafts) < max_pallets:
-                    fresh = new_draft(cls)
-                    pos = try_strict(fresh)
-                    if pos is not None:
-                        self._commit(fresh, chunk, pos, delivery_slots)
-                        current = fresh
-                        placed = True
-                    else:
-                        # New pallet couldn't even fit at strict tier —
-                        # remove the empty draft and fall through.
-                        drafts.remove(fresh)
-                        next_pid[0] -= 1
-
-                # 3. Strict tier on any other existing pallet of this class.
+                # 2. Strict tier on any OTHER existing pallet of this class.
+                #    Doing this BEFORE opening a fresh pallet is the
+                #    difference between "6 pallets used for 38 kegs" and
+                #    "2 pallets used for 38 kegs" — the column-cap on the
+                #    current pallet doesn't mean we need a new slot, just
+                #    a different column on a pallet we already opened.
                 if not placed:
                     best_pos: tuple[float, float, float] | None = None
                     best_d: _PalletDraft | None = None
@@ -448,26 +461,22 @@ class HistoricMimic(Algorithm):
                         current = best_d
                         placed = True
 
-                # 4. Degraded tier 3 on existing pallets (last resort).
-                # Still enforces require_support and the column cap so we
-                # never emit a hard validator error — only OVERLAP_AVOIDED
-                # / FLOATING_AVOIDED warnings at runtime.
-                if not placed:
-                    best_alt: tuple[int, tuple[float, float, float], _PalletDraft] | None = None
-                    for d in drafts:
-                        if d.pallet_class != cls:
-                            continue
-                        result = try_any_tier(d)
-                        if result is None:
-                            continue
-                        tier, pos = result
-                        if best_alt is None or tier < best_alt[0]:
-                            best_alt = (tier, pos, d)
-                    if best_alt is not None:
-                        _, pos, d = best_alt
-                        self._commit(d, chunk, pos, delivery_slots)
-                        current = d
+                # 3. Open a fresh pallet only when nothing existing fits
+                #    AND we haven't blown the per-class quota yet.
+                if (
+                    not placed
+                    and len(drafts) < max_pallets
+                    and cls_pallet_count() < cls_quota
+                ):
+                    fresh = new_draft(cls)
+                    pos = try_strict(fresh)
+                    if pos is not None:
+                        self._commit(fresh, chunk, pos, delivery_slots)
+                        current = fresh
                         placed = True
+                    else:
+                        drafts.remove(fresh)
+                        next_pid[0] -= 1
 
                 if not placed:
                     overflow.append((chunk.client_id, chunk.sku, chunk.qty))
@@ -476,6 +485,9 @@ class HistoricMimic(Algorithm):
         # near the door, latest near the back. KEG drafts sorted to land
         # on the back-most positions of their side (heavier weight should
         # ride low and toward the truck axle).
+        # Stash the truck so the COG-balancing pass inside
+        # _assign_slots can compute lateral COM in real metres.
+        self._truck_for_balance = case.truck
         slot_assignment = self._assign_slots(drafts, slots)
 
         rationale.append(
@@ -488,16 +500,116 @@ class HistoricMimic(Algorithm):
                 f"OVERFLOW: {len(overflow)} chunk(s) did not fit (would drop)."
             )
 
+        delivery_route = self._delivery_route(case, clients, network, loading_route)
+        if [o.client_id for o in delivery_route] != [o.client_id for o in loading_route]:
+            rationale.append(
+                "Delivery-side visit order re-optimized: "
+                f"{[o.client_id for o in delivery_route]}."
+            )
+
         cmds = self._emit_commands(
-            case, route, slots, drafts, slot_assignment, delivery_slots
+            case, delivery_route, slots, drafts, slot_assignment, delivery_slots
         )
 
         return Plan(
             algorithm=self.name,
             commands=tuple(cmds),
             rationale=tuple(rationale),
-            route_order=tuple(o.client_id for o in route),
+            route_order=tuple(o.client_id for o in delivery_route),
         )
+
+    # ---- Route hooks (overridable) ------------------------------------
+
+    def _loading_route(
+        self, case: DayCase, clients: Clients, network: Network
+    ) -> list[ClientOrder]:
+        """Visit order the WAREHOUSE assumes at pick time.
+
+        Defaults to the historic Detalle entrega sequence — the same one
+        Damm currently uses to plan their picking sheet.
+        """
+
+        return list(case.orders)
+
+    def _delivery_route(
+        self,
+        case: DayCase,
+        clients: Clients,
+        network: Network,
+        loading_route: list[ClientOrder],
+    ) -> list[ClientOrder]:
+        """Visit order the DRIVER follows on the road.
+
+        Default: identical to the loading route (faithful historic mimic).
+        Override in subclasses to keep the load-by-reference packing but
+        drive a smarter route on top of it.
+        """
+
+        return loading_route
+
+    def _chunk_sort_key(
+        self,
+        c: _Chunk,
+        sku_max_weight: dict[str, float],
+        sku_total_volume: dict[str, float],
+        delivery_seq: dict[str, int],
+    ) -> tuple:
+        """Default = client-block: chunks for the same client pack
+        consecutively, late-delivery clients sit at the floor (so unloads
+        come off top-down without leaving anyone floating). Override
+        for SKU-block (load-by-reference) or any other strategy.
+        """
+
+        return (
+            -delivery_seq[c.client_id],   # LATE-delivery client first → bottom
+            -sku_max_weight[c.sku],       # heavy SKU first within client
+            -sku_total_volume[c.sku],
+            c.sku,
+        )
+
+    def _make_empties_strategy(
+        self, slot_centers: dict[str, tuple[float, float]]
+    ) -> "_FloorOnlyEmptiesStrategy":
+        """Build the empties-placement strategy.
+
+        Default returns the floor-only Balanced strategy. Override to
+        plug in a stricter strategy (e.g. one that pre-validates each
+        candidate position against the simulator's exact physics rules
+        and refuses placements that would trigger PHYSICS_VIOLATION).
+        """
+
+        return _FloorOnlyEmptiesStrategy(slot_centers)
+
+    @staticmethod
+    def _split_slot_quota(
+        vol_by_class: dict[PalletClass, float],
+        total_slots: int,
+    ) -> dict[PalletClass, int]:
+        """Apportion the truck's slots between KEG and BOX classes by
+        share of total chunk volume, with a guarantee that any class
+        with positive demand gets at least one slot.
+
+        Without this, a few keg SKUs with awkward dims monopolise the
+        slots and the BOX class gets zero — producing the catastrophic
+        ~8 % fill rates the operator was seeing on busy days.
+        """
+
+        keg_vol = vol_by_class.get(PalletClass.KEG, 0.0)
+        box_vol = vol_by_class.get(PalletClass.BOX, 0.0)
+        total = keg_vol + box_vol
+        if total <= 0 or total_slots <= 0:
+            return {PalletClass.KEG: total_slots, PalletClass.BOX: 0}
+        keg_share = keg_vol / total
+        keg_slots = int(round(keg_share * total_slots))
+        if keg_vol > 0 and keg_slots == 0:
+            keg_slots = 1
+        if box_vol > 0 and keg_slots >= total_slots:
+            keg_slots = total_slots - 1
+        keg_slots = max(0, min(total_slots, keg_slots))
+        return {
+            PalletClass.KEG: keg_slots,
+            PalletClass.BOX: total_slots - keg_slots,
+        }
 
     @staticmethod
     def _lifo_ok(
@@ -720,7 +832,107 @@ class HistoricMimic(Algorithm):
             side_weight[slot.side] += d.weight_kg
             side_used[slot.side] = 0
 
+        # COG-aware rebalancing: weight-based assignment above is greedy
+        # and ignores WHERE on the pallet items actually sit (door-edge
+        # vs centerline). Sometimes that drifts lateral COM past the
+        # validator's 0.30 m rollover limit. Iteratively swap an L
+        # pallet with an R pallet whenever the swap reduces |COM_z|.
+        # Within-class only — never swap a KEG pallet with a BOX pallet
+        # (would break GLASS_UNDER_HEAVY / CRUSH_RISK rules).
+        return self._balance_lateral_com(
+            drafts, assignment, slots, self._truck_for_balance,
+        )
+
+    # Subclasses pass `case.truck` via this hook (set inside `plan()`).
+    _truck_for_balance = None
+
+    def _balance_lateral_com(
+        self,
+        drafts: list[_PalletDraft],
+        assignment: dict[str, str],
+        slots: list[Slot],
+        truck,
+        target_offset_m: float = 0.20,
+        max_iter: int = 20,
+    ) -> dict[str, str]:
+        """Swap L↔R pallets (within the same class) to drive the truck's
+        lateral centre of mass toward zero. Greedy hill-climb over swaps."""
+
+        if truck is None:
+            return assignment
+        by_pid = {d.pallet_id: d for d in drafts}
+
+        for _ in range(max_iter):
+            cur = self._lateral_com_z(by_pid, assignment)
+            if abs(cur) <= target_offset_m:
+                break
+            best_offset = abs(cur)
+            best_swap: tuple[str, str] | None = None
+
+            l_pallets = [
+                pid for pid, sid in assignment.items() if sid.startswith("L")
+            ]
+            r_pallets = [
+                pid for pid, sid in assignment.items() if sid.startswith("R")
+            ]
+            for lp in l_pallets:
+                for rp in r_pallets:
+                    if by_pid[lp].pallet_class != by_pid[rp].pallet_class:
+                        continue  # never mix KEG ↔ BOX
+                    trial = dict(assignment)
+                    trial[lp], trial[rp] = trial[rp], trial[lp]
+                    offset = abs(self._lateral_com_z(by_pid, trial))
+                    if offset + 1e-6 < best_offset:
+                        best_offset = offset
+                        best_swap = (lp, rp)
+            if best_swap is None:
+                break
+            lp, rp = best_swap
+            assignment[lp], assignment[rp] = assignment[rp], assignment[lp]
         return assignment
+
+    @staticmethod
+    def _lateral_com_z(
+        by_pid: dict[str, "_PalletDraft"],
+        assignment: dict[str, str],
+    ) -> float:
+        """Lateral centre of mass (z axis in truck-local metres) given
+        a {pallet_id → slot_id} assignment. Mirrors validator math:
+          - L slot centre: z = -0.45 m
+          - R slot centre: z = +0.45 m
+          - B slot centre: z =  0
+          - Item local_z within pallet flips sign on L↔R swap.
+        """
+
+        PALLET_WIDTH = 0.80
+        LR_GAP = 0.10
+        slot_z_for = {
+            "L": -(PALLET_WIDTH / 2.0 + LR_GAP / 2.0),
+            "R": +(PALLET_WIDTH / 2.0 + LR_GAP / 2.0),
+            "B": 0.0,
+        }
+        total_mass = 0.0
+        moment = 0.0
+        for pid, slot_id in assignment.items():
+            d = by_pid.get(pid)
+            if d is None:
+                continue
+            side = slot_id[:1]
+            slot_z = slot_z_for.get(side, 0.0)
+            for it in d.items:
+                mass = it.qty * it.unit_weight_kg
+                if mass <= 0:
+                    continue
+                item_center_y = it.pos_y + it.dim_y / 2.0
+                if side == "L":
+                    local_z = -PALLET_WIDTH / 2.0 + item_center_y
+                elif side == "R":
+                    local_z = +PALLET_WIDTH / 2.0 - item_center_y
+                else:
+                    local_z = item_center_y - PALLET_WIDTH / 2.0
+                moment += mass * (slot_z + local_z)
+                total_mass += mass
+        return moment / total_mass if total_mass > 0 else 0.0
 
     @staticmethod
     def _client_visit_seq(
@@ -835,7 +1047,7 @@ class HistoricMimic(Algorithm):
         # events whenever the cargo below gets delivered.
         from simulator.algorithms.restock_strategy import _RestockContext
         slot_centers = {s.slot_id: self._slot_center(case.truck, s) for s in slots}
-        strategy = _FloorOnlyEmptiesStrategy(slot_centers)
+        strategy = self._make_empties_strategy(slot_centers)
 
         keg_dx, keg_dy, keg_dh = physical_dims("keg")
 

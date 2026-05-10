@@ -128,10 +128,14 @@ function Playback3D({ run }) {
 
 const KPI_CARDS = [
   { key: 'total_minutes',    label: 'Total minutes',    fmt: (v) => v.toFixed(1),     unit: 'min',   lowerBetter: true },
-  { key: 'drive_minutes',    label: 'Drive minutes',    fmt: (v) => v.toFixed(1),     unit: 'min',   lowerBetter: true },
-  { key: 'service_minutes',  label: 'Service minutes',  fmt: (v) => v.toFixed(1),     unit: 'min',   lowerBetter: true },
+  { key: 'driver_minutes',   label: 'Driver shift',     fmt: (v) => `${v.toFixed(1)} (${(v / 60).toFixed(1)}h)`, unit: 'min', lowerBetter: true, highlight: true },
+  { key: 'drive_minutes',    label: 'Drive (driver)',   fmt: (v) => v.toFixed(1),     unit: 'min',   lowerBetter: true, group: 'time' },
+  { key: 'service_minutes',  label: 'Client service (driver)', fmt: (v) => v.toFixed(1), unit: 'min', lowerBetter: true, group: 'time' },
+  { key: 'depot_minutes',    label: 'Depot loading (warehouse)', fmt: (v) => v.toFixed(1), unit: 'min', lowerBetter: true, group: 'time' },
   { key: 'total_km',         label: 'Distance',         fmt: (v) => v.toFixed(1),     unit: 'km',    lowerBetter: true },
   { key: 'search_moves',     label: 'Search moves',     fmt: (v) => Math.round(v),    unit: 'units', lowerBetter: true, highlight: true },
+  { key: 'driver_labor_eur', label: 'Driver labor',     fmt: (v) => v.toFixed(2),     unit: '€',     lowerBetter: true, group: 'cost' },
+  { key: 'depot_labor_eur',  label: 'Loader labor',     fmt: (v) => v.toFixed(2),     unit: '€',     lowerBetter: true, group: 'cost' },
   { key: 'total_cost_eur',   label: 'Total cost',       fmt: (v) => v.toFixed(0),     unit: '€',     lowerBetter: true },
   { key: 'co2_kg',           label: 'CO₂',              fmt: (v) => v.toFixed(1),     unit: 'kg',    lowerBetter: true },
   { key: 'fill_rate',        label: 'Fill rate',        fmt: (v) => `${(v * 100).toFixed(1)}%`, unit: '',  lowerBetter: false },
@@ -331,6 +335,644 @@ function AlgorithmSection({ algo, run, baselineKpis, onRun }) {
   );
 }
 
+// Picks the headline metrics worth showing first in the aggregate table.
+const BATCH_KPI_KEYS = [
+  'total_minutes',
+  'drive_minutes',
+  'service_minutes',
+  'total_km',
+  'search_moves',
+  'total_cost_eur',
+  'co2_kg',
+  'fill_rate',
+  'returnables_picked_units',
+  'placement_rejections',
+  'lost_units',
+  'wall_clock_sec',
+];
+
+function fmt(n, digits = 2) {
+  if (n === null || n === undefined || Number.isNaN(n)) return '—';
+  return Number(n).toFixed(digits);
+}
+
+function BatchPanel({
+  algo, days,
+  mode, onModeChange,
+  n, onNChange,
+  seed, onSeedChange,
+  selected, onTogglePick,
+  status, error, data,
+  onRun,
+}) {
+  const stats = data;
+  return (
+    <section className="batch-panel">
+      <header className="batch-header">
+        <div>
+          <span className="algo-tag">BATCH</span>
+          <h3 style={{ display: 'inline-block', margin: '0 0 0 8px' }}>
+            Run <code>{algo || '—'}</code> on multiple datasets
+          </h3>
+        </div>
+        <StatusPill status={status} />
+      </header>
+
+      <div className="batch-controls">
+        <div className="control-group">
+          <label>Mode</label>
+          <select value={mode} onChange={(e) => onModeChange(e.target.value)}>
+            <option value="first">first N (sorted)</option>
+            <option value="random">random N (seeded)</option>
+            <option value="all">all available</option>
+            <option value="selected">manual pick</option>
+          </select>
+        </div>
+        {mode !== 'all' && mode !== 'selected' && (
+          <div className="control-group">
+            <label>N cases</label>
+            <input
+              type="number" min={1} max={200} value={n}
+              onChange={(e) => onNChange(Math.max(1, parseInt(e.target.value, 10) || 1))}
+              style={{ width: 80 }}
+            />
+          </div>
+        )}
+        {mode === 'random' && (
+          <div className="control-group">
+            <label>Seed</label>
+            <input
+              type="number" value={seed}
+              onChange={(e) => onSeedChange(parseInt(e.target.value, 10) || 0)}
+              style={{ width: 80 }}
+            />
+          </div>
+        )}
+        <button
+          className="btn-primary big"
+          onClick={onRun}
+          disabled={status === 'loading' || !algo || (mode === 'selected' && !selected.length)}
+        >
+          {status === 'loading' ? 'Running…' : `▶ Run on ${mode === 'selected' ? `${selected.length} picked` : mode === 'all' ? 'all' : `${n}`}`}
+        </button>
+      </div>
+
+      {mode === 'selected' && (
+        <details className="batch-picker" open={selected.length === 0}>
+          <summary>Pick datasets ({selected.length} selected)</summary>
+          <div className="batch-picker-list">
+            {days.map((d) => {
+              const isPicked = selected.some((p) => p.date === d.date && p.ruta === d.ruta);
+              return (
+                <label key={`${d.date}-${d.ruta}`} className={`batch-pick-row${isPicked ? ' picked' : ''}`}>
+                  <input
+                    type="checkbox"
+                    checked={isPicked}
+                    onChange={() => onTogglePick(d)}
+                  />
+                  <span className="bp-date">{d.date}</span>
+                  <span className="bp-ruta">{d.ruta}</span>
+                  <span className="bp-meta">{d.clients} clients · {d.lines} lines</span>
+                </label>
+              );
+            })}
+          </div>
+        </details>
+      )}
+
+      {error && <div className="algo-error" style={{ marginTop: 12 }}>Error: {error}</div>}
+
+      {stats && status === 'ok' && (
+        <div className="batch-results">
+          <div className="batch-summary-grid">
+            <SummaryCard label="Cases" value={stats.n_cases} />
+            <SummaryCard label="Success" value={`${stats.n_success}/${stats.n_cases}`} good={stats.n_success === stats.n_cases} />
+            <SummaryCard label="Failed (sim)" value={stats.n_failed} bad={stats.n_failed > 0} />
+            <SummaryCard label="Invalid plan" value={stats.n_invalid_plan} bad={stats.n_invalid_plan > 0} />
+            <SummaryCard label="Physics-V cases" value={stats.n_with_physics} bad={stats.n_with_physics > 0} />
+            <SummaryCard label="Physics-V events" value={stats.total_physics_violations} bad={stats.total_physics_violations > 0} />
+            <SummaryCard label="Total drops" value={stats.total_drops} bad={stats.total_drops > 0} />
+            <SummaryCard label="Capacity-V" value={stats.total_capacity_violations} bad={stats.total_capacity_violations > 0} />
+            <SummaryCard label="Validation errors" value={stats.total_validation_errors} bad={stats.total_validation_errors > 0} />
+            <SummaryCard label="Validation warnings" value={stats.total_validation_warnings} />
+            <SummaryCard label="Clean rate" value={`${(stats.clean_rate * 100).toFixed(1)}%`} good={stats.clean_rate >= 0.9} />
+            <SummaryCard label="Wall time" value={`${stats.duration_sec.toFixed(1)}s`} />
+          </div>
+
+          <h4 className="batch-h">Distribution per KPI</h4>
+          <div className="batch-table-wrap">
+            <table className="batch-table">
+              <thead>
+                <tr>
+                  <th>Metric</th>
+                  <th>n</th><th>sum</th><th>mean</th>
+                  <th>median</th><th>stdev</th>
+                  <th>min</th><th>max</th><th>p95</th>
+                </tr>
+              </thead>
+              <tbody>
+                {BATCH_KPI_KEYS.map((k) => {
+                  const a = stats.aggregates?.[k];
+                  if (!a) return null;
+                  return (
+                    <tr key={k}>
+                      <td className="metric">{k}</td>
+                      <td>{a.n}</td>
+                      <td>{fmt(a.sum)}</td>
+                      <td>{fmt(a.mean, 3)}</td>
+                      <td>{fmt(a.median, 3)}</td>
+                      <td>{fmt(a.stdev, 3)}</td>
+                      <td>{fmt(a.min, 3)}</td>
+                      <td>{fmt(a.max, 3)}</td>
+                      <td>{fmt(a.p95, 3)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <h4 className="batch-h">Per-case results ({stats.cases.length})</h4>
+          <div className="batch-table-wrap">
+            <table className="batch-table batch-cases">
+              <thead>
+                <tr>
+                  <th>Date</th><th>Ruta</th><th>OK</th>
+                  <th>Time (min)</th><th>Km</th><th>Search</th>
+                  <th>Cost (€)</th><th>Fill %</th><th>Drops</th>
+                  <th>Cap-V</th><th>Phys-V</th><th>Val-E</th>
+                  <th title="Items the simulator refused to place (overlap/float/oob)">
+                    Lost
+                  </th>
+                  <th>Wall (s)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stats.cases.map((c) => {
+                  const k = c.kpis || {};
+                  const lost = k.lost_units ?? 0;
+                  const bad =
+                    !c.success ||
+                    c.physics_violations > 0 ||
+                    c.validation_errors > 0 ||
+                    lost > 0;
+                  return (
+                    <tr key={`${c.date}-${c.ruta}`} className={bad ? 'row-bad' : ''}>
+                      <td>{c.date}</td>
+                      <td><code>{c.ruta}</code></td>
+                      <td>{c.success ? '✓' : '✕'}</td>
+                      <td>{fmt(k.total_minutes, 1)}</td>
+                      <td>{fmt(k.total_km, 1)}</td>
+                      <td>{fmt(k.search_moves, 0)}</td>
+                      <td>{fmt(k.total_cost_eur, 0)}</td>
+                      <td>{fmt((k.fill_rate ?? 0) * 100, 1)}</td>
+                      <td>{fmt(k.drops, 0)}</td>
+                      <td>{fmt(k.capacity_violations, 0)}</td>
+                      <td>{c.physics_violations}</td>
+                      <td>{c.validation_errors}</td>
+                      <td>{fmt(lost, 0)}</td>
+                      <td>{fmt(c.elapsed_sec, 2)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {stats.failures?.length > 0 && (
+            <details className="batch-failures">
+              <summary>Failures ({stats.failures.length})</summary>
+              <ul>
+                {stats.failures.map((f, i) => (
+                  <li key={i}><code>{f.date} {f.ruta}</code> — {f.error}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SummaryCard({ label, value, good, bad }) {
+  const cls = `batch-card${good ? ' good' : ''}${bad ? ' bad' : ''}`;
+  return (
+    <div className={cls}>
+      <div className="bc-label">{label}</div>
+      <div className="bc-value">{value}</div>
+    </div>
+  );
+}
+
+// === Compare panel ====================================================
+//
+// Head-to-head comparison: run TWO algorithms on the SAME N cases, then
+// surface paired deltas (algoB − algoA) per metric. The "paired" framing
+// means route difficulty washes out — even on a small sample we get a
+// clean A-vs-B effect.
+
+const COMPARE_KPI_KEYS = [
+  'total_minutes',
+  'drive_minutes',
+  'service_minutes',
+  'depot_minutes',
+  'total_km',
+  'search_moves',
+  'total_cost_eur',
+  'driver_labor_eur',
+  'depot_labor_eur',
+  'co2_kg',
+  'fill_rate',
+  'returnables_picked_units',
+  'placement_rejections',
+  'lost_units',
+];
+
+function deltaCellClass(deltaPct, lowerBetter) {
+  if (Math.abs(deltaPct) < 0.05) return '';
+  const better = lowerBetter ? deltaPct < 0 : deltaPct > 0;
+  return better ? 'cmp-good' : 'cmp-bad';
+}
+
+function ComparePanel({
+  algorithms, days,
+  algoA, onAlgoAChange,
+  algoB, onAlgoBChange,
+  mode, onModeChange,
+  n, onNChange,
+  seed, onSeedChange,
+  selected, onTogglePick,
+  status, error, data,
+  onRun,
+}) {
+  const filteredMetrics = (data?.metrics || []).filter((m) =>
+    COMPARE_KPI_KEYS.includes(m.metric),
+  );
+  const headlineMetrics = ['total_cost_eur', 'total_minutes', 'total_km', 'search_moves'];
+
+  return (
+    <section className="batch-panel cmp-panel">
+      <header className="batch-header">
+        <div>
+          <span className="algo-tag">COMPARE</span>
+          <h3 style={{ display: 'inline-block', margin: '0 0 0 8px' }}>
+            Head-to-head: <code>{algoA || '—'}</code> vs <code>{algoB || '—'}</code>
+          </h3>
+        </div>
+        <StatusPill status={status} />
+      </header>
+
+      <div className="batch-controls">
+        <div className="control-group">
+          <label>Algorithm A (baseline)</label>
+          <select value={algoA || ''} onChange={(e) => onAlgoAChange(e.target.value)}>
+            {algorithms.map((a) => (
+              <option key={a.name} value={a.name}>{a.name}</option>
+            ))}
+          </select>
+        </div>
+        <div className="control-group">
+          <label>Algorithm B (challenger)</label>
+          <select value={algoB || ''} onChange={(e) => onAlgoBChange(e.target.value)}>
+            {algorithms.map((a) => (
+              <option key={a.name} value={a.name}>{a.name}</option>
+            ))}
+          </select>
+        </div>
+        <div className="control-group">
+          <label>Mode</label>
+          <select value={mode} onChange={(e) => onModeChange(e.target.value)}>
+            <option value="first">first N</option>
+            <option value="random">random N</option>
+            <option value="all">all</option>
+            <option value="selected">manual pick</option>
+          </select>
+        </div>
+        {mode !== 'all' && mode !== 'selected' && (
+          <div className="control-group">
+            <label>N cases</label>
+            <input
+              type="number" min={1} max={200} value={n}
+              onChange={(e) => onNChange(Math.max(1, parseInt(e.target.value, 10) || 1))}
+              style={{ width: 80 }}
+            />
+          </div>
+        )}
+        {mode === 'random' && (
+          <div className="control-group">
+            <label>Seed</label>
+            <input
+              type="number" value={seed}
+              onChange={(e) => onSeedChange(parseInt(e.target.value, 10) || 0)}
+              style={{ width: 80 }}
+            />
+          </div>
+        )}
+        <button
+          className="btn-primary big"
+          onClick={onRun}
+          disabled={
+            status === 'loading'
+            || !algoA || !algoB || algoA === algoB
+            || (mode === 'selected' && !selected.length)
+          }
+        >
+          {status === 'loading'
+            ? 'Running…'
+            : `▶ Compare on ${mode === 'selected' ? `${selected.length} picked` : mode === 'all' ? 'all' : `${n}`}`}
+        </button>
+      </div>
+
+      {algoA && algoB && algoA === algoB && (
+        <div className="algo-error" style={{ marginTop: 8 }}>
+          Algorithm A and B must differ — pick two different algorithms.
+        </div>
+      )}
+
+      {mode === 'selected' && (
+        <details className="batch-picker" open={selected.length === 0}>
+          <summary>Pick datasets ({selected.length} selected)</summary>
+          <div className="batch-picker-list">
+            {days.map((d) => {
+              const isPicked = selected.some((p) => p.date === d.date && p.ruta === d.ruta);
+              return (
+                <label key={`${d.date}-${d.ruta}`} className={`batch-pick-row${isPicked ? ' picked' : ''}`}>
+                  <input
+                    type="checkbox"
+                    checked={isPicked}
+                    onChange={() => onTogglePick(d)}
+                  />
+                  <span className="bp-date">{d.date}</span>
+                  <span className="bp-ruta">{d.ruta}</span>
+                  <span className="bp-meta">{d.clients} clients · {d.lines} lines</span>
+                </label>
+              );
+            })}
+          </div>
+        </details>
+      )}
+
+      {error && <div className="algo-error" style={{ marginTop: 12 }}>Error: {error}</div>}
+
+      {data && status === 'ok' && (
+        <div className="batch-results">
+          <div className="cmp-headline-grid">
+            <div className="cmp-headline-block">
+              <div className="cmp-headline-label">A · {data.algo_a}</div>
+              <div className="cmp-headline-stat">
+                {data.a_stats.n_success}/{data.a_stats.n_cases} OK · {data.a_stats.total_physics_violations} phys-V
+              </div>
+              <div className="cmp-headline-stat dim">
+                €{Math.round(
+                  (data.a_stats.aggregates?.total_cost_eur?.mean || 0),
+                )} avg · {(data.a_stats.aggregates?.total_km?.mean || 0).toFixed(1)} km avg
+              </div>
+            </div>
+            <div className="cmp-headline-vs">vs</div>
+            <div className="cmp-headline-block">
+              <div className="cmp-headline-label">B · {data.algo_b}</div>
+              <div className="cmp-headline-stat">
+                {data.b_stats.n_success}/{data.b_stats.n_cases} OK · {data.b_stats.total_physics_violations} phys-V
+              </div>
+              <div className="cmp-headline-stat dim">
+                €{Math.round(
+                  (data.b_stats.aggregates?.total_cost_eur?.mean || 0),
+                )} avg · {(data.b_stats.aggregates?.total_km?.mean || 0).toFixed(1)} km avg
+              </div>
+            </div>
+          </div>
+
+          <div className="batch-summary-grid" style={{ marginTop: 14 }}>
+            <SummaryCard label="Cases compared" value={data.n_cases} />
+            <SummaryCard label="Paired (both ran)" value={data.n_paired} />
+            <SummaryCard label="A-only success" value={data.a_only_success} bad={data.a_only_success > 0} />
+            <SummaryCard label="B-only success" value={data.b_only_success} bad={data.b_only_success > 0} />
+            <SummaryCard label="Both failed" value={data.both_failed} bad={data.both_failed > 0} />
+            <SummaryCard label="Wall time" value={`${data.duration_sec.toFixed(1)}s`} />
+          </div>
+
+          <h4 className="batch-h">Headline (B − A)</h4>
+          <div className="cmp-headline-cards">
+            {filteredMetrics
+              .filter((m) => headlineMetrics.includes(m.metric))
+              .sort((a, b) => headlineMetrics.indexOf(a.metric) - headlineMetrics.indexOf(b.metric))
+              .map((m) => {
+                const cls = deltaCellClass(m.delta_pct_mean, m.lower_better);
+                const winner = m.b_wins > m.a_wins ? 'B' : m.a_wins > m.b_wins ? 'A' : '=';
+                return (
+                  <div key={m.metric} className={`cmp-card ${cls}`}>
+                    <div className="cmp-card-label">{m.metric}</div>
+                    <div className="cmp-card-delta">
+                      {m.delta_pct_mean >= 0 ? '+' : ''}
+                      {m.delta_pct_mean.toFixed(1)}%
+                    </div>
+                    <div className="cmp-card-sub">
+                      A {m.a_mean.toFixed(1)} → B {m.b_mean.toFixed(1)}
+                    </div>
+                    <div className="cmp-card-wins">
+                      A {m.a_wins} · B {m.b_wins} · = {m.ties} ({winner === '=' ? 'tie' : `${winner} wins`})
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+
+          <h4 className="batch-h">Paired metric table</h4>
+          <div className="batch-table-wrap">
+            <table className="batch-table">
+              <thead>
+                <tr>
+                  <th>Metric</th>
+                  <th>n</th>
+                  <th>A mean</th><th>B mean</th>
+                  <th>Δ mean</th><th>Δ %</th>
+                  <th>Δ median</th>
+                  <th>A wins</th><th>B wins</th><th>ties</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredMetrics.map((m) => {
+                  const cls = deltaCellClass(m.delta_pct_mean, m.lower_better);
+                  return (
+                    <tr key={m.metric}>
+                      <td className="metric">
+                        {m.metric}
+                        {m.lower_better ? <span className="cmp-hint" title="lower is better"> ↓</span> : <span className="cmp-hint" title="higher is better"> ↑</span>}
+                      </td>
+                      <td>{m.n_paired}</td>
+                      <td>{fmt(m.a_mean, 3)}</td>
+                      <td>{fmt(m.b_mean, 3)}</td>
+                      <td className={cls}>{fmt(m.delta_mean, 3)}</td>
+                      <td className={cls}>
+                        {m.delta_pct_mean >= 0 ? '+' : ''}
+                        {fmt(m.delta_pct_mean, 1)}%
+                      </td>
+                      <td>{fmt(m.delta_median, 3)}</td>
+                      <td>{m.a_wins}</td>
+                      <td>{m.b_wins}</td>
+                      <td>{m.ties}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <h4 className="batch-h">Per-case (B − A)</h4>
+          <div className="batch-table-wrap">
+            <table className="batch-table batch-cases">
+              <thead>
+                <tr>
+                  <th>Date</th><th>Ruta</th>
+                  <th>A cost</th><th>B cost</th><th>Δ %</th>
+                  <th>A km</th><th>B km</th>
+                  <th>A search</th><th>B search</th>
+                  <th>A phys</th><th>B phys</th>
+                  <th>A lost</th><th>B lost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.cases.map((c) => {
+                  const ak = c.a?.kpis || {};
+                  const bk = c.b?.kpis || {};
+                  const aCost = ak.total_cost_eur ?? 0;
+                  const bCost = bk.total_cost_eur ?? 0;
+                  const dPct = aCost > 0 ? ((bCost - aCost) / aCost) * 100 : 0;
+                  return (
+                    <tr key={`${c.date}-${c.ruta}`}>
+                      <td>{c.date}</td>
+                      <td><code>{c.ruta}</code></td>
+                      <td>{fmt(aCost, 0)}</td>
+                      <td>{fmt(bCost, 0)}</td>
+                      <td className={deltaCellClass(dPct, true)}>
+                        {dPct >= 0 ? '+' : ''}{fmt(dPct, 1)}%
+                      </td>
+                      <td>{fmt(ak.total_km, 1)}</td>
+                      <td>{fmt(bk.total_km, 1)}</td>
+                      <td>{fmt(ak.search_moves, 0)}</td>
+                      <td>{fmt(bk.search_moves, 0)}</td>
+                      <td>{c.a?.physics_violations ?? 0}</td>
+                      <td>{c.b?.physics_violations ?? 0}</td>
+                      <td>{fmt(ak.lost_units, 0)}</td>
+                      <td>{fmt(bk.lost_units, 0)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="cmp-issues-grid">
+            <IssuesByAlgo
+              label={`A · ${data.algo_a}`}
+              cases={data.a_stats.cases}
+            />
+            <IssuesByAlgo
+              label={`B · ${data.algo_b}`}
+              cases={data.b_stats.cases}
+            />
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Per-algorithm validation-issue feed: every issue surfaced by the
+// validator on every dataset, grouped by (date, ruta), severity-coloured.
+// Lets the user see — at a glance — *which* errors hit *which* dataset
+// in a given comparison sweep.
+function IssuesByAlgo({ label, cases }) {
+  const [filter, setFilter] = useState('all'); // all | error | warning | info
+  const totals = { error: 0, warning: 0, info: 0 };
+  for (const c of cases || []) {
+    for (const i of c.issues || []) {
+      if (i.severity === 'error') totals.error += 1;
+      else if (i.severity === 'warning') totals.warning += 1;
+      else totals.info += 1;
+    }
+  }
+  const sevRank = { error: 0, warning: 1, info: 2 };
+  const passes = (sev) => filter === 'all' || sev === filter;
+
+  // Cases that have at least one issue passing the filter.
+  const visibleCases = (cases || [])
+    .map((c) => ({
+      ...c,
+      _shownIssues: (c.issues || [])
+        .filter((i) => passes(i.severity))
+        .sort((a, b) => sevRank[a.severity] - sevRank[b.severity]),
+    }))
+    .filter((c) => c._shownIssues.length > 0);
+
+  return (
+    <div className="cmp-issues-block">
+      <div className="cmp-issues-header">
+        <div className="cmp-issues-label">{label}</div>
+        <div className="cmp-issues-totals">
+          <span className="ci-pill ci-pill-error">{totals.error} errors</span>
+          <span className="ci-pill ci-pill-warning">{totals.warning} warnings</span>
+          <span className="ci-pill ci-pill-info">{totals.info} info</span>
+        </div>
+      </div>
+      <div className="cmp-issues-filter">
+        {['all', 'error', 'warning', 'info'].map((opt) => (
+          <button
+            key={opt}
+            className={`ci-filter${filter === opt ? ' active' : ''}`}
+            onClick={() => setFilter(opt)}
+          >
+            {opt}
+          </button>
+        ))}
+      </div>
+      {visibleCases.length === 0 ? (
+        <div className="cmp-issues-empty">
+          No {filter === 'all' ? '' : filter + ' '}issues across {cases?.length || 0} cases.
+        </div>
+      ) : (
+        <ul className="cmp-issues-list">
+          {visibleCases.map((c) => (
+            <li key={`${c.date}-${c.ruta}`} className="cmp-issue-case">
+              <div className="ci-case-header">
+                <span className="ci-case-date">{c.date}</span>
+                <span className="ci-case-ruta">{c.ruta}</span>
+                <span className="ci-case-counts">
+                  {c.validation_errors > 0 && (
+                    <span className="ci-mini ci-mini-error">
+                      {c.validation_errors}E
+                    </span>
+                  )}
+                  {c.validation_warnings > 0 && (
+                    <span className="ci-mini ci-mini-warning">
+                      {c.validation_warnings}W
+                    </span>
+                  )}
+                  {c.physics_violations > 0 && (
+                    <span className="ci-mini ci-mini-error">
+                      {c.physics_violations} phys-V
+                    </span>
+                  )}
+                </span>
+              </div>
+              <ul className="ci-issue-rows">
+                {c._shownIssues.map((i, idx) => (
+                  <li key={idx} className={`ci-issue ci-issue-${i.severity}`}>
+                    <span className="ci-sev">{i.severity}</span>
+                    <code className="ci-code">{i.code}</code>
+                    <span className="ci-msg">{i.message}</span>
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export default function AlgorithmsPage() {
   const [algorithms, setAlgorithms] = useState([]);
   const [trucks, setTrucks] = useState([]);
@@ -342,6 +984,28 @@ export default function AlgorithmsPage() {
   const [runs, setRuns] = useState({});           // { algoName: {status, data, error} }
   const [bootError, setBootError] = useState(null);
   const [loadingBoot, setLoadingBoot] = useState(true);
+
+  // Batch mode (run one algorithm on many datasets, get aggregate stats).
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchMode, setBatchMode] = useState('first');   // first | random | all | selected
+  const [batchN, setBatchN] = useState(10);
+  const [batchSeed, setBatchSeed] = useState(42);
+  const [batchSelected, setBatchSelected] = useState([]); // [{date, ruta}]
+  const [batchStatus, setBatchStatus] = useState('idle'); // idle | loading | ok | error
+  const [batchError, setBatchError] = useState(null);
+  const [batchData, setBatchData] = useState(null);
+
+  // Compare mode (head-to-head: TWO algos on SAME N cases).
+  const [compareOpen, setCompareOpen] = useState(false);
+  const [compareAlgoA, setCompareAlgoA] = useState(null);
+  const [compareAlgoB, setCompareAlgoB] = useState(null);
+  const [compareMode, setCompareMode] = useState('first');
+  const [compareN, setCompareN] = useState(10);
+  const [compareSeed, setCompareSeed] = useState(42);
+  const [compareSelected, setCompareSelected] = useState([]);
+  const [compareStatus, setCompareStatus] = useState('idle');
+  const [compareError, setCompareError] = useState(null);
+  const [compareData, setCompareData] = useState(null);
 
   useEffect(() => {
     let dead = false;
@@ -362,6 +1026,8 @@ export default function AlgorithmsPage() {
         }
         if (algos.length > 0) {
           setSelectedAlgo(algos[0].name);
+          setCompareAlgoA(algos[0].name);
+          setCompareAlgoB(algos.length > 1 ? algos[1].name : algos[0].name);
         }
       } catch (e) {
         if (dead) return;
@@ -408,6 +1074,89 @@ export default function AlgorithmsPage() {
     const v = e.target.value;
     setSelectedTruck(v === '' ? null : v);
     setRuns({});
+  };
+
+  const runBatch = useCallback(async () => {
+    if (!selectedAlgo) return;
+    setBatchStatus('loading');
+    setBatchError(null);
+    try {
+      const payload = {
+        algo: selectedAlgo,
+        truckCode: selectedTruck || undefined,
+        seed: batchSeed,
+      };
+      if (batchMode === 'selected') {
+        if (!batchSelected.length) {
+          throw new Error('Pick at least one dataset');
+        }
+        payload.cases = batchSelected;
+        payload.mode = 'explicit';
+      } else {
+        payload.mode = batchMode;
+        payload.n = batchN;
+      }
+      const data = await api.multiRun(payload);
+      setBatchData(data);
+      setBatchStatus('ok');
+    } catch (e) {
+      setBatchError(e.message || String(e));
+      setBatchStatus('error');
+    }
+  }, [selectedAlgo, selectedTruck, batchMode, batchN, batchSeed, batchSelected]);
+
+  const toggleBatchPick = (d) => {
+    setBatchSelected((prev) => {
+      const has = prev.some((p) => p.date === d.date && p.ruta === d.ruta);
+      if (has) return prev.filter((p) => !(p.date === d.date && p.ruta === d.ruta));
+      return [...prev, { date: d.date, ruta: d.ruta }];
+    });
+  };
+
+  const runCompare = useCallback(async () => {
+    if (!compareAlgoA || !compareAlgoB) return;
+    if (compareAlgoA === compareAlgoB) {
+      setCompareError('Pick two different algorithms');
+      setCompareStatus('error');
+      return;
+    }
+    setCompareStatus('loading');
+    setCompareError(null);
+    try {
+      const payload = {
+        algoA: compareAlgoA,
+        algoB: compareAlgoB,
+        truckCode: selectedTruck || undefined,
+        seed: compareSeed,
+      };
+      if (compareMode === 'selected') {
+        if (!compareSelected.length) {
+          throw new Error('Pick at least one dataset');
+        }
+        payload.cases = compareSelected;
+        payload.mode = 'explicit';
+      } else {
+        payload.mode = compareMode;
+        payload.n = compareN;
+      }
+      const data = await api.multiCompare(payload);
+      setCompareData(data);
+      setCompareStatus('ok');
+    } catch (e) {
+      setCompareError(e.message || String(e));
+      setCompareStatus('error');
+    }
+  }, [
+    compareAlgoA, compareAlgoB, compareMode, compareN, compareSeed,
+    compareSelected, selectedTruck,
+  ]);
+
+  const toggleComparePick = (d) => {
+    setCompareSelected((prev) => {
+      const has = prev.some((p) => p.date === d.date && p.ruta === d.ruta);
+      if (has) return prev.filter((p) => !(p.date === d.date && p.ruta === d.ruta));
+      return [...prev, { date: d.date, ruta: d.ruta }];
+    });
   };
 
   const activeAlgo = algorithms.find((a) => a.name === selectedAlgo);
@@ -485,6 +1234,62 @@ export default function AlgorithmsPage() {
           <br />
           Start it with: <code>python3 -m simulator.api --port 8000</code>
         </div>
+      )}
+
+      <div className="batch-toggle-wrap">
+        <button
+          className="btn-ghost"
+          onClick={() => setBatchOpen((v) => !v)}
+        >
+          {batchOpen ? '▾ Hide batch mode' : '▸ Batch mode — run on multiple datasets'}
+        </button>
+        <button
+          className="btn-ghost"
+          onClick={() => setCompareOpen((v) => !v)}
+          style={{ marginLeft: 8 }}
+        >
+          {compareOpen ? '▾ Hide compare mode' : '▸ Compare mode — head-to-head on N datasets'}
+        </button>
+      </div>
+      {batchOpen && (
+        <BatchPanel
+          algo={selectedAlgo}
+          days={days}
+          mode={batchMode}
+          onModeChange={setBatchMode}
+          n={batchN}
+          onNChange={setBatchN}
+          seed={batchSeed}
+          onSeedChange={setBatchSeed}
+          selected={batchSelected}
+          onTogglePick={toggleBatchPick}
+          status={batchStatus}
+          error={batchError}
+          data={batchData}
+          onRun={runBatch}
+        />
+      )}
+      {compareOpen && (
+        <ComparePanel
+          algorithms={algorithms}
+          days={days}
+          algoA={compareAlgoA}
+          onAlgoAChange={setCompareAlgoA}
+          algoB={compareAlgoB}
+          onAlgoBChange={setCompareAlgoB}
+          mode={compareMode}
+          onModeChange={setCompareMode}
+          n={compareN}
+          onNChange={setCompareN}
+          seed={compareSeed}
+          onSeedChange={setCompareSeed}
+          selected={compareSelected}
+          onTogglePick={toggleComparePick}
+          status={compareStatus}
+          error={compareError}
+          data={compareData}
+          onRun={runCompare}
+        />
       )}
 
       <main className="algo-grid">

@@ -1,19 +1,21 @@
-"""Pluggable algorithms producing Plans."""
+"""Pluggable algorithms producing Plans.
 
-from simulator.algorithms.balanced import BalancedLoader
+Two algorithms shipped:
+  - `historic`       — driver's actual visit order + COG-aware client-block
+                        loading (the production algorithm).
+  - `historic-load`  — cheapest possible warehouse load (pure SKU-block,
+                        load-by-reference) + TSP-optimal driver route.
+                        Used to compare loader savings vs driver cost.
+"""
+
 from simulator.algorithms.base import Algorithm
 from simulator.algorithms.historic import HistoricMimic
-from simulator.algorithms.lifo import LifoArchitect
-from simulator.algorithms.nearest import NearestNeighborSmart
-from simulator.algorithms.replay import ReplayBaseline
+from simulator.algorithms.historic_load import HistoricLoad
 
 
 REGISTRY: dict[str, type[Algorithm]] = {
-    "replay": ReplayBaseline,
-    "nearest": NearestNeighborSmart,
-    "balanced": BalancedLoader,
-    "lifo": LifoArchitect,
     "historic": HistoricMimic,
+    "historic-load": HistoricLoad,
 }
 
 

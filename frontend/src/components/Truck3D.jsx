@@ -176,6 +176,34 @@ function CargoBox({
   };
 
   const meshKey = `${typeCode || 'x'}-${letterTex ? 'on' : 'off'}`;
+  const isKeg = (typeCode || '').toUpperCase() === 'K';
+
+  if (isKeg) {
+    // Kegs render as cylinders. Diameter is the smaller of the two
+    // floor footprint sides so the cylinder always fits inside the
+    // chunk's AABB; height matches the chunk's stack height. The side
+    // surface gets the letter texture (single material — no per-face
+    // assignment for cylinders); top + bottom are clean.
+    const radius = Math.min(size.len, size.width) / 2;
+    return (
+      <group position={[position.x, position.y, position.z]}>
+        <mesh
+          key={meshKey}
+          onPointerOver={onPointerOver}
+          onPointerOut={onPointerOut}
+          onPointerDown={onPointerDown}
+        >
+          <cylinderGeometry args={[radius, radius, size.h, 32]} />
+          {/* side */}
+          <meshStandardMaterial attach="material-0" {...matBase} map={letterTex || null} />
+          {/* top */}
+          <meshStandardMaterial attach="material-1" {...matBase} />
+          {/* bottom */}
+          <meshStandardMaterial attach="material-2" {...matBase} />
+        </mesh>
+      </group>
+    );
+  }
 
   return (
     <group position={[position.x, position.y, position.z]}>
@@ -241,16 +269,75 @@ function TruckShell({ totalSidePos, backOnly = false }) {
     : 2 * (PALLET_WIDTH + 0.05) + 2 * TRUCK_WALL_PAD;
   const truckHeight = PALLET_HEIGHT + 0.2;
 
+  // Cabin: sits in front of the cargo bay (door side = -X). Roughly
+  // 1.6 m deep, full truck width, slightly shorter than the cargo box
+  // for a peterbilt silhouette. Windscreen tilt is faked with a
+  // smaller upper box.
+  const cabinDepth = 1.6;
+  const cabinHeight = truckHeight * 0.85;
+  const cabinFront = -truckLength / 2 - cabinDepth / 2;
+  const cabinTopHeight = cabinHeight * 0.55;
+  const windowsHeight = cabinHeight * 0.35;
+
+  // Wheels: 4 corners of cargo bay + 2 under cabin = 6 total. Sit
+  // just outside the body so they're visible from the side. Center
+  // is at y = -wheelRadius so the wheel hangs below the truck floor
+  // and is visible from any oblique angle.
+  const wheelRadius = 0.32;
+  const wheelWidth = 0.22;
+  const wheelY = -wheelRadius * 0.6;  // sits partly below floor, partly visible alongside
+  const wheelOffsetZ = truckWidth / 2 + wheelWidth / 2 + 0.02;
+  const cargoFrontX = -truckLength / 2 + 0.7;
+  const cargoBackX = +truckLength / 2 - 0.7;
+  const cabinWheelX = cabinFront + 0.3;
+  const wheelPositions = [
+    [cargoFrontX, wheelY, -wheelOffsetZ],
+    [cargoFrontX, wheelY, +wheelOffsetZ],
+    [cargoBackX, wheelY, -wheelOffsetZ],
+    [cargoBackX, wheelY, +wheelOffsetZ],
+    [cabinWheelX, wheelY, -wheelOffsetZ],
+    [cabinWheelX, wheelY, +wheelOffsetZ],
+  ];
+
   return (
     <group>
+      {/* Cargo floor */}
       <mesh position={[0, -TRUCK_FLOOR_THICKNESS / 2, 0]}>
         <boxGeometry args={[truckLength, TRUCK_FLOOR_THICKNESS, truckWidth]} />
         <meshStandardMaterial color="#1a1a1a" roughness={0.85} />
       </mesh>
+      {/* Cargo wireframe outline */}
       <mesh position={[0, truckHeight / 2, 0]}>
         <boxGeometry args={[truckLength, truckHeight, truckWidth]} />
         <meshBasicMaterial color="#fc0" wireframe transparent opacity={0.3} />
       </mesh>
+      {/* Cabin lower body */}
+      <mesh position={[cabinFront, cabinTopHeight / 2, 0]}>
+        <boxGeometry args={[cabinDepth, cabinTopHeight, truckWidth]} />
+        <meshStandardMaterial color="#2a2a2a" roughness={0.7} />
+        <Edges color="#fc0" threshold={1} lineWidth={1} />
+      </mesh>
+      {/* Cabin upper (cab + windscreen). Slightly inset and shorter
+          to suggest a sloped windshield. */}
+      <mesh
+        position={[cabinFront + 0.15, cabinTopHeight + windowsHeight / 2, 0]}
+      >
+        <boxGeometry args={[cabinDepth - 0.4, windowsHeight, truckWidth - 0.1]} />
+        <meshStandardMaterial color="#0a1622" roughness={0.3} metalness={0.2} />
+        <Edges color="#fc0" threshold={1} lineWidth={1} />
+      </mesh>
+      {/* Wheels — solid black with yellow contour edges. */}
+      {wheelPositions.map(([x, y, z], i) => (
+        <mesh
+          key={`wheel-${i}`}
+          position={[x, y, z]}
+          rotation={[Math.PI / 2, 0, 0]}
+        >
+          <cylinderGeometry args={[wheelRadius, wheelRadius, wheelWidth, 24]} />
+          <meshBasicMaterial color="#000000" />
+          <Edges color="#fc0" threshold={1} lineWidth={1.5} />
+        </mesh>
+      ))}
     </group>
   );
 }

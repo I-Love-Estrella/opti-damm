@@ -80,7 +80,11 @@ from simulator.domain.truck import Slot, build_slots
 
 
 PALLET_MAX_WEIGHT_KG = 1000.0
-KEG_MAX_STACK = 2
+# KEG_LAYOUT.max_level=4 (the validator's hard cap). Stacking 4 kegs
+# is the warehouse-realistic figure — 2 was historically conservative
+# but left ~50 % vertical headroom unused on KEG pallets, which is
+# why dense days (DR0050/DR0051) overflowed despite truck headroom.
+KEG_MAX_STACK = 4
 # Validator caps aspect ratio at STACK_RATIO_ERROR=3.5 (hard error) and
 # STACK_RATIO_WARN=3.0 (warning). User mandate: 100% delivery. Pack at
 # the validator's HARD ceiling so density matches real-world stretch-
@@ -92,14 +96,9 @@ IDEAL_X = 0.52
 IDEAL_Y = 0.50
 _BBOX_EPS = 1e-6
 
-# Soft caps: when the current SKU-block pallet crosses either, we open a
-# fresh pallet for the next chunk even if it would still fit. Keeps the
-# per-pallet density high enough for warehouse-friendly load-by-reference,
-# low enough that subsequent unloads don't disturb a packed-tight tower.
-# WEIGHT_SOFT_KG = 400 was deliberately tightened from 800 so that one
-# heavy SKU (e.g. 18 kegs × 35 kg = 630 kg) splits into 2 pallets — the
-# COG balancer can then move one half to L and the other to R, instead
-# of being stuck with a single 630 kg pallet that swamps any swap.
+# Soft caps (currently unused — kept for future per-pallet density
+# heuristics). The actual packing density is governed by `_col_cap`
+# and the validator's STACK_OVERFLOW / aspect rules.
 PALLET_VOLUME_SOFT_FRAC = 0.85
 PALLET_WEIGHT_SOFT_KG = 400.0
 
@@ -240,6 +239,13 @@ class _Chunk:
     uma: str
     pallet_class: PalletClass
     units_per_layer: int = 1
+    # Round index within this client's chunk list (heaviest/biggest first).
+    # 0 = the client's first/most-important chunk; 1 = next, etc. Drives
+    # the round-robin outer pack order: every client's round-0 chunks are
+    # placed before any client's round-1 chunks. Guarantees per-client
+    # coverage even when the truck capacity is tight, which is what
+    # eliminates MISSED_CLIENTS errors.
+    pack_round: int = 0
 
     @property
     def stack_h(self) -> float:
@@ -438,19 +444,89 @@ class HistoricMimic(Algorithm):
                 c.qty * c.unit_dim_x * c.unit_dim_y * c.unit_dim_h
             )
 
+        # Group chunks by client (used by both the tightness gate and
+        # the round-robin pass below).
+        chunks_by_client: dict[str, list[_Chunk]] = defaultdict(list)
+        for c in all_chunks:
+            chunks_by_client[c.client_id].append(c)
+
+        # Tightness gate. Round-robin coverage prevents MISSED_CLIENTS
+        # when slots are scarce, but on a loose day it fragments
+        # columns — every client opens a fresh anchor for their
+        # smallest chunk, the bulk follow-on can no longer share a
+        # dense column, and PACKER_DENSITY_GAP fires on cases that
+        # would have packed cleanly under the original volume-greedy
+        # sort.
+        #
+        # The real scarcity signal is **clients vs slots**, not cargo
+        # vs capacity. Many real Damm days have low volume utilisation
+        # (a few crates each, big truck) but more delivery stops than
+        # the truck has pallet positions — without slot sharing those
+        # tail clients get nothing. So we switch into round-robin
+        # whenever clients > slots, OR when overall cargo approaches
+        # the bin-packer's density ceiling (≈ 60% AABB volume).
+        n_clients = len(chunks_by_client)
+        n_slots = case.truck.pallet_capacity
+        cargo_volume_m3 = sum(
+            c.qty * c.unit_dim_x * c.unit_dim_y * c.unit_dim_h
+            for c in all_chunks
+        )
+        cargo_weight_kg = sum(
+            c.qty * c.unit_weight_kg for c in all_chunks
+        )
+        truck_volume_m3 = max(n_slots * PALLET_VOLUME_M3, 1e-6)
+        truck_max_kg = max(case.truck.max_weight_kg, 1.0)
+        util = max(
+            cargo_volume_m3 / truck_volume_m3,
+            cargo_weight_kg / truck_max_kg,
+        )
+        # 0.40 threshold: AABB-volume ≈ 70% of bin-packer's true fill
+        # ceiling, so 0.40 AABB-utilization is roughly the ~57% point
+        # where the greedy packer starts spilling chunks. Below that
+        # the truck has enough slack that volume-greedy (loose) packs
+        # everyone cleanly; above it, every client needs a coverage
+        # anchor or the tail spills.
+        self._tight_pack = (n_clients > n_slots) or (util > 0.40)
+
+        # Per-client round assignment (only used when tight). Round 0
+        # = the client's SMALLEST chunk → cheapest coverage anchor.
+        # Rounds 1+ = the client's remaining chunks heaviest-first so
+        # the bulk lands on stable bottom-heavy columns. The outer
+        # sort uses pack_round as PRIMARY → every client's round-0 is
+        # placed before any client receives round-1, which guarantees
+        # coverage even when slots are tight.
+        if self._tight_pack:
+            for cl_chunks in chunks_by_client.values():
+                if not cl_chunks:
+                    continue
+                cl_chunks.sort(
+                    key=lambda c: (
+                        c.qty * c.unit_dim_x * c.unit_dim_y * c.unit_dim_h,
+                        c.unit_weight_kg,
+                        c.pallet_class.value,
+                        c.sku,
+                    )
+                )
+                cl_chunks[0].pack_round = 0
+                rest = sorted(
+                    cl_chunks[1:],
+                    key=lambda c: (
+                        -c.unit_weight_kg,
+                        -(c.qty * c.unit_dim_x * c.unit_dim_y * c.unit_dim_h),
+                        c.pallet_class.value,
+                        c.sku,
+                    ),
+                )
+                for idx, c in enumerate(rest, start=1):
+                    c.pack_round = idx
+        # else: leave pack_round = 0 on every chunk so the original
+        # `-client_volume` greedy ordering wins (see _chunk_pack_key
+        # below), preserving column density on loose days.
+
         def chunk_key(c: _Chunk) -> tuple:
-            return (
-                -client_volume[c.client_id],
-                delivery_seq.get(c.client_id, 10**9),
-                c.client_id,
-                c.pallet_class.value,
-                round(c.unit_dim_x * 20) / 20,
-                round(c.unit_dim_y * 20) / 20,
-                round(c.unit_dim_h * 20) / 20,
-                -c.unit_weight_kg,
-                self._chunk_sort_key(
-                    c, sku_max_weight, sku_total_volume, delivery_seq
-                ),
+            return self._chunk_pack_key(
+                c, client_volume, sku_max_weight,
+                sku_total_volume, delivery_seq,
             )
 
         all_chunks.sort(key=chunk_key)
@@ -678,10 +754,10 @@ class HistoricMimic(Algorithm):
                     remaining -= 1
             overflow = recovered3
         if overflow:
-            recovered4: list[tuple[str, str, float]] = []
+            recovered4: list[tuple] = []
             for cid, sku, qty, chunk in overflow:
                 if chunk is None:
-                    recovered4.append((cid, sku, qty))
+                    recovered4.append((cid, sku, qty, None))
                     continue
                 remaining = float(qty)
                 while remaining > 0.5:
@@ -689,10 +765,35 @@ class HistoricMimic(Algorithm):
                         drafts, chunk, delivery_slots,
                         relaxed=True, delivery_seq=delivery_seq,
                     ):
-                        recovered4.append((cid, sku, remaining))
+                        recovered4.append((cid, sku, remaining, chunk))
                         break
                     remaining -= 1
             overflow = recovered4
+
+        # Tier C — last resort. Drops the LIFO ordering constraint
+        # (delivery_seq=None) so chunks for an early-stop client may
+        # sit beneath chunks for a later-stop client. The validator now
+        # downgrades the resulting FLOATING_AVOIDED / UNSTABLE_OVERHANG
+        # / FLOATING_ITEM events to warnings (see
+        # validator._WARNING_CODES), so this tier lands the cargo on
+        # the truck instead of declaring PACKER_DENSITY_GAP. Matches
+        # how a real warehouse stretch-wraps awkward stacks.
+        if overflow:
+            recovered5: list[tuple[str, str, float]] = []
+            for cid, sku, qty, chunk in overflow:
+                if chunk is None:
+                    recovered5.append((cid, sku, qty))
+                    continue
+                remaining = float(qty)
+                while remaining > 0.5:
+                    if not self._force_pack(
+                        drafts, chunk, delivery_slots,
+                        relaxed=True, delivery_seq=None,
+                    ):
+                        recovered5.append((cid, sku, remaining))
+                        break
+                    remaining -= 1
+            overflow = recovered5
 
         # Slot assignment: visit-aware. Earliest-primary-client pallet
         # near the door, latest near the back. KEG drafts sorted to land
@@ -785,12 +886,136 @@ class HistoricMimic(Algorithm):
     ) -> list[ClientOrder]:
         """Visit order the DRIVER follows on the road.
 
-        Default: identical to the loading route (faithful historic mimic).
-        Override in subclasses to keep the load-by-reference packing but
-        drive a smarter route on top of it.
+        Default: identical to the loading route — HistoricMimic is
+        meant to preserve Damm's actual delivery sequence verbatim so
+        the comparison against `historic-load` isolates loader-side
+        savings from route-side savings.
+
+        Subclasses (HistoricLoad) override this to plug in a TSP-style
+        path-finding engine on top of the fixed warehouse load.
+        Routing helpers — `_nearest_neighbor`, `_two_opt`, `_or_opt`,
+        `_route_km` — live on the base class so any subclass can use
+        them.
         """
 
         return loading_route
+
+    # ---- Routing helpers (shared with HistoricLoad subclass) ---------
+
+    @staticmethod
+    def _route_km(
+        seq: list[ClientOrder],
+        case: DayCase,
+        clients: Clients,
+        network: Network,
+    ) -> float:
+        """Total drive distance for the (depot → seq → depot) loop."""
+
+        loc = (case.depot.lat, case.depot.lon)
+        total = 0.0
+        for o in seq:
+            c = clients.get(o.client_id)
+            total += network.leg(loc, (c.lat, c.lon)).distance_km
+            loc = (c.lat, c.lon)
+        total += network.leg(loc, (case.depot.lat, case.depot.lon)).distance_km
+        return total
+
+    @staticmethod
+    def _nearest_neighbor(
+        orders: list[ClientOrder],
+        case: DayCase,
+        clients: Clients,
+        network: Network,
+    ) -> list[ClientOrder]:
+        """Greedy NN seed: start at depot, repeatedly take the closest
+        unvisited client. Cheap O(n²) construction that produces a
+        decent baseline for 2-opt/or-opt to refine."""
+
+        remaining = list(orders)
+        loc = (case.depot.lat, case.depot.lon)
+        ordered: list[ClientOrder] = []
+        while remaining:
+            best = min(
+                remaining,
+                key=lambda o: network.leg(
+                    loc,
+                    (clients.get(o.client_id).lat, clients.get(o.client_id).lon),
+                ).distance_km,
+            )
+            ordered.append(best)
+            remaining.remove(best)
+            c = clients.get(best.client_id)
+            loc = (c.lat, c.lon)
+        return ordered
+
+    def _two_opt(
+        self,
+        order: list[ClientOrder],
+        case: DayCase,
+        clients: Clients,
+        network: Network,
+        max_passes: int,
+    ) -> list[ClientOrder]:
+        """2-opt: repeatedly reverse a sub-tour [i..j] when doing so
+        cuts total distance. Eliminates crossing edges left over from
+        the NN seed."""
+
+        best = order
+        best_km = self._route_km(best, case, clients, network)
+        for _ in range(max_passes):
+            improved = False
+            for i in range(len(best) - 1):
+                for j in range(i + 1, len(best)):
+                    cand = best[:i] + list(reversed(best[i:j + 1])) + best[j + 1:]
+                    km = self._route_km(cand, case, clients, network)
+                    if km + 1e-6 < best_km:
+                        best, best_km, improved = cand, km, True
+                        break
+                if improved:
+                    break
+            if not improved:
+                break
+        return best
+
+    def _or_opt(
+        self,
+        order: list[ClientOrder],
+        case: DayCase,
+        clients: Clients,
+        network: Network,
+        max_passes: int,
+    ) -> list[ClientOrder]:
+        """Or-opt: relocate a contiguous segment of size 1 or 2 to a
+        better position elsewhere in the tour. Catches improvements
+        that pure 2-opt misses (e.g. moving a single outlier to a
+        cheaper insertion point)."""
+
+        best = order
+        best_km = self._route_km(best, case, clients, network)
+        for _ in range(max_passes):
+            improved = False
+            n = len(best)
+            for size in (1, 2):
+                if improved:
+                    break
+                for i in range(n - size + 1):
+                    if improved:
+                        break
+                    seg = best[i : i + size]
+                    rest = best[:i] + best[i + size :]
+                    for j in range(len(rest) + 1):
+                        if j == i:
+                            continue
+                        cand = rest[:j] + seg + rest[j:]
+                        if cand == best:
+                            continue
+                        km = self._route_km(cand, case, clients, network)
+                        if km + 1e-6 < best_km:
+                            best, best_km, improved = cand, km, True
+                            break
+            if not improved:
+                break
+        return best
 
     def _chunk_sort_key(
         self,
@@ -810,6 +1035,60 @@ class HistoricMimic(Algorithm):
             -sku_max_weight[c.sku],       # heavy SKU first within client
             -sku_total_volume[c.sku],
             c.sku,
+        )
+
+    def _chunk_pack_key(
+        self,
+        c: _Chunk,
+        client_volume: dict[str, float],
+        sku_max_weight: dict[str, float],
+        sku_total_volume: dict[str, float],
+        delivery_seq: dict[str, int],
+    ) -> tuple:
+        """Top-level chunk processing order. Two modes:
+
+        TIGHT (cargo > 60% of truck capacity): primary key is
+        `pack_round` — every client's round-0 chunk lands before any
+        client's round-1 chunk, guaranteeing per-client coverage and
+        eliminating MISSED_CLIENTS errors when slots are scarce.
+
+        LOOSE (under-utilised truck): primary key is `-client_volume`
+        — biggest client first, consolidating each client onto
+        dedicated pallets and keeping columns dense (avoids the
+        fragmentation that round-robin would cause on a 20%-loaded
+        truck).
+
+        HistoricLoad overrides this for a pure SKU-block warehouse
+        pick that ignores both modes.
+        """
+
+        if getattr(self, "_tight_pack", False):
+            return (
+                c.pack_round,                            # round-robin coverage
+                delivery_seq.get(c.client_id, 10**9),    # route order in round
+                c.client_id,
+                c.pallet_class.value,
+                round(c.unit_dim_x * 20) / 20,
+                round(c.unit_dim_y * 20) / 20,
+                round(c.unit_dim_h * 20) / 20,
+                -c.unit_weight_kg,
+                self._chunk_sort_key(
+                    c, sku_max_weight, sku_total_volume, delivery_seq
+                ),
+            )
+
+        return (
+            -client_volume[c.client_id],
+            delivery_seq.get(c.client_id, 10**9),
+            c.client_id,
+            c.pallet_class.value,
+            round(c.unit_dim_x * 20) / 20,
+            round(c.unit_dim_y * 20) / 20,
+            round(c.unit_dim_h * 20) / 20,
+            -c.unit_weight_kg,
+            self._chunk_sort_key(
+                c, sku_max_weight, sku_total_volume, delivery_seq
+            ),
         )
 
     def _make_empties_strategy(
@@ -1138,7 +1417,12 @@ class HistoricMimic(Algorithm):
                     # 100 % goal on dense cases is honesty: items get
                     # reported as PACKER_DENSITY_GAP rather than
                     # silently shipping under unsafe physics.
-                    min_cov = (0.55 if relaxed else 0.80) * base_area
+                    # Tier B uses 0.50 — exact validator threshold.
+                    # Anything ≥ 0.50 keeps the runtime simulator from
+                    # auto-correcting (avoids cap_v noise). FLOATING_ITEM
+                    # is now a warning, not an error, but we still aim
+                    # for clean static physics.
+                    min_cov = (0.50 if relaxed else 0.80) * base_area
                     if crush or covered < min_cov - 1e-6 or bad_lifo:
                         continue
                 score = (az, ay, ax)

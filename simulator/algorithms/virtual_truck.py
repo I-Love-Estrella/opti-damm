@@ -416,6 +416,23 @@ class VirtualTruck:
         foreign: list[PalletItem] = []
         seen_same: set[int] = set()
         seen_foreign: set[int] = set()
+        stop_client = targets[0][1] if targets else None
+
+        def add_blocker(it: PalletItem) -> None:
+            if id(it) in target_ids:
+                return
+            if it.intended_client == stop_client:
+                if id(it) not in seen_same:
+                    seen_same.add(id(it))
+                    same_client.append(it)
+            else:
+                if id(it) not in seen_foreign:
+                    seen_foreign.add(id(it))
+                    foreign.append(it)
+
+        # Phase 1: collect direct blockers (above-target or edge-blocker
+        # at lower y with xz overlap) for every target.
+        queue: list[PalletItem] = []
         for tgt in target_items:
             for it in items:
                 if id(it) in target_ids or it.qty <= 0:
@@ -428,16 +445,32 @@ class VirtualTruck:
                 )
                 if not (is_above or is_edge):
                     continue
-                # Use targets[0]'s client as the stop's client.
-                stop_client = targets[0][1] if targets else None
-                if it.intended_client == stop_client:
-                    if id(it) not in seen_same:
-                        seen_same.add(id(it))
-                        same_client.append(it)
-                else:
-                    if id(it) not in seen_foreign:
-                        seen_foreign.add(id(it))
-                        foreign.append(it)
+                add_blocker(it)
+                queue.append(it)
+
+        # Phase 2: TRANSITIVELY collect items resting on top of any
+        # already-recorded blocker. When the simulator lifts a blocker
+        # to set it aside, anything physically supported by that
+        # blocker must come off first — otherwise the support is
+        # whisked away mid-route and the upper item is left hanging.
+        # We BFS down the support chain until no new items are added.
+        seen_visit = {id(b) for b in queue}
+        while queue:
+            base = queue.pop()
+            for it in items:
+                if id(it) in target_ids or id(it) in seen_visit:
+                    continue
+                if it.qty <= 0:
+                    continue
+                # "Above base" means it.pos_z is at or above base.top_z
+                # AND its footprint overlaps base in xy.
+                if it.pos_z + 1e-6 < base.top_z:
+                    continue
+                if not it.overlaps_xy(base):
+                    continue
+                seen_visit.add(id(it))
+                add_blocker(it)
+                queue.append(it)
         return target_items, same_client, foreign
 
     def plan_restock(

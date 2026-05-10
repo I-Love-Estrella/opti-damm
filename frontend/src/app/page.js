@@ -22,7 +22,7 @@ export default function LandingPage() {
       {/* Classification strip */}
       <div className="classification">
         <div className="cl-l">
-          <span className="chip red">BEERANTIR &middot; INTERNAL</span>
+          <span className="chip red">OPTI-DAMM &middot; INTERNAL</span>
           <span className="chip">PUBLIC RELEASE 0.4</span>
           <span className="sep">/</span>
           <span>BCN &middot; MOLLET DEL VALL&Egrave;S</span>
@@ -39,7 +39,7 @@ export default function LandingPage() {
       {/* Nav */}
       <nav className="nav">
         <Link href="/" className="brand">
-          <span className="mark">Beer<span className="ant">antir</span></span>
+          <span className="mark">opti-<span className="ant">damm</span></span>
           <span className="v">v0.4 &middot; 2026</span>
         </Link>
         <div className="nav-links">
@@ -69,7 +69,7 @@ export default function LandingPage() {
             for the trucks that <em>still need to move</em>.
           </h1>
           <p className="lede">
-            Beerantir is a dispatcher-grade decision layer for beverage logistics. Real routes, real loads, a co-pilot that explains the trade-offs &mdash; so route planners ship more pallets, with fewer empties, in tighter windows.
+            opti-damm is a dispatcher-grade decision layer for beverage logistics. Real routes, real loads, a co-pilot that explains the trade-offs &mdash; so route planners ship more pallets, with fewer empties, in tighter windows.
           </p>
           <div className="hero-cta">
             <a href="#final" className="btn red">Request a pilot &rarr;</a>
@@ -214,12 +214,12 @@ export default function LandingPage() {
       <section id="how">
         <div className="section-eyebrow"><span className="num">03</span> How it works</div>
         <h2 className="section-title">From depot manifest to driver phone, in <em>four steps</em>.</h2>
-        <p className="section-sub">Beerantir doesn&rsquo;t replace your TMS. It sits on top &mdash; reading orders, returning routes, exposing the trade-offs. Two-week pilot, one truck, real data.</p>
+        <p className="section-sub">opti-damm doesn&rsquo;t replace your TMS. It sits on top &mdash; reading orders, returning routes, exposing the trade-offs. Two-week pilot, one truck, real data.</p>
         <div className="how-steps">
           <div className="step">
             <div className="num">01 &middot; INGEST</div>
             <div className="h">Read your orders</div>
-            <div className="b">Connect to your TMS, ERP, or a CSV drop. Beerantir maps SKUs, clients, windows, and returnables into a unified run model.</div>
+            <div className="b">Connect to your TMS, ERP, or a CSV drop. opti-damm maps SKUs, clients, windows, and returnables into a unified run model.</div>
           </div>
           <div className="step">
             <div className="num">02 &middot; PLAN</div>
@@ -362,7 +362,7 @@ export default function LandingPage() {
         <div className="section-eyebrow"><span className="num">06</span> FAQ</div>
         <h2 className="section-title">Questions planners ask in the <em>first ten minutes</em>.</h2>
         <div className="faq-list">
-          <FaqItem num="01" defaultOpen q="Does Beerantir replace our TMS?" a="No. Beerantir reads from your existing TMS and writes manifests back to it. We sit on top of the source-of-truth — orders, fleet, drivers — and add the optimisation, the explanation, and the in-cab handoff." />
+          <FaqItem num="01" defaultOpen q="Does opti-damm replace our TMS?" a="No. opti-damm reads from your existing TMS and writes manifests back to it. We sit on top of the source-of-truth — orders, fleet, drivers — and add the optimisation, the explanation, and the in-cab handoff." />
           <FaqItem num="02" q="How long is a pilot?" a="Six weeks, one truck, your real routes. Week one is connection and shadow-mode. Week two onwards we run live, side-by-side with the planner." />
           <FaqItem num="03" q="What does the co-pilot actually do?" a="Three things: explains a plan in plain language, proposes changes when something breaks (cancellation, traffic, late delivery), and keeps an audit log of every decision. The planner stays in charge — every action requires their approval." />
           <FaqItem num="04" q="Where does our data live?" a="EU data residency by default — Frankfurt and Madrid regions. On-prem deployment available on the Reserva tier. SOC 2 Type II in progress; GDPR-compliant from day one." />
@@ -397,7 +397,7 @@ export default function LandingPage() {
         <div className="landing-footer">
           <div>
             <Link href="/" className="brand">
-              <span className="mark">Beer<span className="ant">antir</span></span>
+              <span className="mark">opti-<span className="ant">damm</span></span>
             </Link>
             <p className="blurb">Operational intelligence for beverage logistics. Built in Mollet del Vallès, deployed across the Iberian peninsula.</p>
           </div>
@@ -430,7 +430,7 @@ export default function LandingPage() {
           </div>
         </div>
         <div className="footer-meta">
-          <span>&copy; 2026 BEERANTIR S.L. &middot; MOLLET DEL VALL&Egrave;S &middot; BUILD 2026.05.09</span>
+          <span>&copy; 2026 OPTI-DAMM S.L. &middot; MOLLET DEL VALL&Egrave;S &middot; BUILD 2026.05.09</span>
           <span>NODE BCN-OPS-02 &middot; CLEARANCE: PUBLIC</span>
         </div>
       </footer>

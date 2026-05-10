@@ -20,7 +20,7 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata = {
-  title: "Beerantir — operational intelligence for beverage logistics",
+  title: "opti-damm — operational intelligence for beverage logistics",
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

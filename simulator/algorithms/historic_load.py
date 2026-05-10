@@ -81,6 +81,36 @@ class HistoricLoad(HistoricMimic):
             c.client_id,                # tiebreaker only
         )
 
+    def _chunk_pack_key(
+        self,
+        c: _Chunk,
+        client_volume: dict[str, float],
+        sku_max_weight: dict[str, float],
+        sku_total_volume: dict[str, float],
+        delivery_seq: dict[str, int],
+    ) -> tuple:
+        """Top-level packing order is by SKU, NOT by client. The
+        warehouse picker walks each SKU zone once, dumps everything
+        from that zone onto whichever pallet has matching footprint.
+        delivery_seq is excluded entirely — the route is computed
+        AFTER the load is fixed, so the loader cannot peek at it.
+        Heaviest SKU first keeps crush safety at the floor; SKU
+        identity then groups all customers' demand for that SKU into
+        consecutive picks; class + footprint + weight are the
+        bin-packer's tie-breakers."""
+
+        return (
+            -sku_max_weight[c.sku],
+            -sku_total_volume[c.sku],
+            c.sku,
+            c.pallet_class.value,
+            round(c.unit_dim_x * 20) / 20,
+            round(c.unit_dim_y * 20) / 20,
+            round(c.unit_dim_h * 20) / 20,
+            -c.unit_weight_kg,
+            c.client_id,
+        )
+
     # ---- Routing: TSP-shortest on top of the fixed load --------------
 
     def _delivery_route(
@@ -104,103 +134,7 @@ class HistoricLoad(HistoricMimic):
         seq = self._or_opt(seq, case, clients, network, max_passes=_OR_OPT_PASSES)
         return seq
 
-    # ---- Routing helpers (kept local so this file is self-contained) -
-
-    @staticmethod
-    def _route_km(
-        seq: list[ClientOrder],
-        case: DayCase,
-        clients: Clients,
-        network: Network,
-    ) -> float:
-        loc = (case.depot.lat, case.depot.lon)
-        total = 0.0
-        for o in seq:
-            c = clients.get(o.client_id)
-            total += network.leg(loc, (c.lat, c.lon)).distance_km
-            loc = (c.lat, c.lon)
-        total += network.leg(loc, (case.depot.lat, case.depot.lon)).distance_km
-        return total
-
-    @staticmethod
-    def _nearest_neighbor(
-        orders: list[ClientOrder],
-        case: DayCase,
-        clients: Clients,
-        network: Network,
-    ) -> list[ClientOrder]:
-        remaining = list(orders)
-        loc = (case.depot.lat, case.depot.lon)
-        ordered: list[ClientOrder] = []
-        while remaining:
-            best = min(
-                remaining,
-                key=lambda o: network.leg(
-                    loc, (clients.get(o.client_id).lat, clients.get(o.client_id).lon)
-                ).distance_km,
-            )
-            ordered.append(best)
-            remaining.remove(best)
-            c = clients.get(best.client_id)
-            loc = (c.lat, c.lon)
-        return ordered
-
-    def _two_opt(
-        self,
-        order: list[ClientOrder],
-        case: DayCase,
-        clients: Clients,
-        network: Network,
-        max_passes: int,
-    ) -> list[ClientOrder]:
-        best = order
-        best_km = self._route_km(best, case, clients, network)
-        for _ in range(max_passes):
-            improved = False
-            for i in range(len(best) - 1):
-                for j in range(i + 1, len(best)):
-                    cand = best[:i] + list(reversed(best[i:j + 1])) + best[j + 1:]
-                    km = self._route_km(cand, case, clients, network)
-                    if km + 1e-6 < best_km:
-                        best, best_km, improved = cand, km, True
-                        break
-                if improved:
-                    break
-            if not improved:
-                break
-        return best
-
-    def _or_opt(
-        self,
-        order: list[ClientOrder],
-        case: DayCase,
-        clients: Clients,
-        network: Network,
-        max_passes: int,
-    ) -> list[ClientOrder]:
-        best = order
-        best_km = self._route_km(best, case, clients, network)
-        for _ in range(max_passes):
-            improved = False
-            n = len(best)
-            for size in (1, 2):
-                if improved:
-                    break
-                for i in range(n - size + 1):
-                    if improved:
-                        break
-                    seg = best[i : i + size]
-                    rest = best[:i] + best[i + size :]
-                    for j in range(len(rest) + 1):
-                        if j == i:
-                            continue
-                        cand = rest[:j] + seg + rest[j:]
-                        if cand == best:
-                            continue
-                        km = self._route_km(cand, case, clients, network)
-                        if km + 1e-6 < best_km:
-                            best, best_km, improved = cand, km, True
-                            break
-            if not improved:
-                break
-        return best
+    # Routing helpers (`_route_km`, `_nearest_neighbor`, `_two_opt`,
+    # `_or_opt`) live on the base class HistoricMimic — both algorithms
+    # share the same path-finding engine; only the loading order
+    # differs.

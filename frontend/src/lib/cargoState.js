@@ -535,3 +535,27 @@ export function computeCenterOfMass(boxes = []) {
     vertical_y: my / totalMass,
   };
 }
+
+/**
+ * Mass per slot (one entry per pallet position) for the per-slot
+ * axle-balance grid. Returns:
+ *   {
+ *     bySlot:  { L1: 1060, L2: 200, ..., R3: 503, ... },
+ *     maxPos:  N (positions per L/R side; T6=3, T8=4),
+ *   }
+ *
+ * Items in the driver's hands (status !== 'in_pallet') are skipped.
+ */
+export function computeSlotMass(boxes = []) {
+  const maxPos = _maxSidePos(boxes);
+  const bySlot = {};
+  for (const b of boxes) {
+    if (b.status !== 'in_pallet') continue;
+    const mass = (b.qty ?? 0) * (b.unit_weight_kg ?? 0);
+    if (mass <= 0) continue;
+    const slotId = b.slot_id || '';
+    if (!slotId) continue;
+    bySlot[slotId] = (bySlot[slotId] || 0) + mass;
+  }
+  return { bySlot, maxPos };
+}

@@ -13,6 +13,7 @@ import {
   flattenStages,
   buildLiftReplaceMap,
   computeCenterOfMass,
+  computeSlotMass,
   COM_LATERAL_WARN_M,
   COM_LATERAL_ERROR_M,
   COM_LONGITUDINAL_WARN_M,
@@ -30,7 +31,91 @@ function comTone(value, warn, err) {
   return { color: '#3aff80', label: 'OK' };
 }
 
-function CenterOfMassPanel({ com }) {
+function QuadrantGrid({ slotMass }) {
+  const { bySlot, maxPos } = slotMass;
+  const positions = maxPos > 0 ? maxPos : 4;  // T6 has 3, T8 has 4
+  let total = 0;
+  let left = 0;
+  let right = 0;
+  let front = 0;
+  let back = 0;
+  for (const [sid, kg] of Object.entries(bySlot)) {
+    total += kg;
+    if (sid[0] === 'L') left += kg;
+    else if (sid[0] === 'R') right += kg;
+    const pos = parseInt(sid.slice(1), 10) || 0;
+    if (pos <= Math.ceil(positions / 2)) front += kg;
+    else back += kg;
+  }
+  const lrBal = total > 0 ? 1 - Math.abs(left - right) / total : 1;
+  const fbBal = total > 0 ? 1 - Math.abs(front - back) / total : 1;
+  const balPct = Math.round(Math.min(lrBal, fbBal) * 100);
+  const balColor = balPct >= 80 ? '#3aff80' : balPct >= 60 ? '#fc0' : '#ff5050';
+  const cell = (slotId) => {
+    const kg = bySlot[slotId] || 0;
+    return (
+      <div
+        key={slotId}
+        style={{
+          background: '#0f0f0f',
+          border: '1px solid #1f1f1f',
+          padding: '6px 4px',
+          textAlign: 'center',
+        }}
+      >
+        <div style={{ color: '#666', fontSize: 9, marginBottom: 2 }}>
+          {slotId}
+        </div>
+        <div style={{ color: '#cfcfcf', fontWeight: 600, fontSize: 11 }}>
+          {kg.toFixed(0)} kg
+        </div>
+      </div>
+    );
+  };
+  // Render rows from front (position 1) to back (position N), L | R.
+  const rows = [];
+  for (let p = 1; p <= positions; p++) {
+    rows.push(cell(`L${p}`));
+    rows.push(cell(`R${p}`));
+  }
+  return (
+    <div>
+      <div
+        style={{
+          color: '#888',
+          letterSpacing: '0.08em',
+          fontSize: 10,
+          marginBottom: 4,
+        }}
+      >
+        WEIGHT BY SLOT
+      </div>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          gap: 4,
+        }}
+      >
+        {rows}
+      </div>
+      <div
+        style={{
+          marginTop: 6,
+          display: 'flex',
+          justifyContent: 'space-between',
+          fontSize: 10,
+          color: '#888',
+        }}
+      >
+        <span>Balance</span>
+        <span style={{ color: balColor, fontWeight: 600 }}>{balPct}%</span>
+      </div>
+    </div>
+  );
+}
+
+function CenterOfMassPanel({ com, slotMass }) {
   const lateral = comTone(com.lateral_z, COM_LATERAL_WARN_M, COM_LATERAL_ERROR_M);
   // longitudinal is warning-only (axle imbalance)
   const longi = comTone(
@@ -174,6 +259,8 @@ function CenterOfMassPanel({ com }) {
         </span>
       </div>
 
+      {slotMass && <QuadrantGrid slotMass={slotMass} />}
+
       <div
         style={{
           marginTop: 'auto',
@@ -234,6 +321,7 @@ function Playback3D({ run }) {
 
   // Recompute COG every step.
   const com = useMemo(() => computeCenterOfMass(state.boxes), [state.boxes]);
+  const slotMass = useMemo(() => computeSlotMass(state.boxes), [state.boxes]);
 
   if (!truck || flatStages.length === 0) return null;
 
@@ -286,7 +374,7 @@ function Playback3D({ run }) {
             height={480}
           />
         </div>
-        <CenterOfMassPanel com={com} />
+        <CenterOfMassPanel com={com} slotMass={slotMass} />
       </div>
       <StepPlayer
         stages={flatStages}
@@ -1416,7 +1504,7 @@ export default function AlgorithmsPage() {
     <div className="algo-page">
       <div className="classification">
         <div className="cl-l">
-          <span className="chip red">BEERANTIR · INTERNAL</span>
+          <span className="chip red">OPTI-DAMM · INTERNAL</span>
           <span className="chip">ALGORITHMS LAB</span>
           <span className="sep">/</span>
           <span>SIM API · {SIM_API_BASE}</span>
@@ -1430,7 +1518,7 @@ export default function AlgorithmsPage() {
 
       <header className="algo-page-header">
         <div className="brand">
-          <Link href="/">← Beer<span className="ant">antir</span></Link>
+          <Link href="/">← opti-<span className="ant">damm</span></Link>
           <span className="page-title">Algorithms · head-to-head on real Damm days</span>
         </div>
         <div className="header-actions">
@@ -1562,7 +1650,7 @@ export default function AlgorithmsPage() {
       </main>
 
       <footer className="algo-footer">
-        <span>BEERANTIR · ALGORITHMS LAB · v0.1 · BUILD 2026.05.09</span>
+        <span>OPTI-DAMM · ALGORITHMS LAB · v0.1 · BUILD 2026.05.09</span>
         <span>PICK A DAY AND ALGORITHM · RUN TO SEE KPIS</span>
       </footer>
     </div>

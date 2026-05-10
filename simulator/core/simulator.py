@@ -1455,7 +1455,7 @@ def _minutes_to_time(t_min: float) -> dt.time:
 
 _PALLET_LENGTH_M = 1.20
 _PALLET_WIDTH_M = 0.80
-_PALLET_HEIGHT_M = 1.80
+_PALLET_HEIGHT_M = 2.40
 # 0.1 mm — strict enough to catch real overlaps, loose enough to not
 # trip on floating-point noise. Accumulated rounding inside a long
 # stack chain stays well under this.

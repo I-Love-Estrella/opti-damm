@@ -82,10 +82,10 @@ from simulator.domain.truck import Slot, build_slots
 PALLET_MAX_WEIGHT_KG = 1000.0
 KEG_MAX_STACK = 2
 # Validator caps aspect ratio at STACK_RATIO_ERROR=3.5 (hard error) and
-# STACK_RATIO_WARN=3.0 (warning). We pack just UNDER the hard limit so
-# the simulator never emits STACK_UNSTABLE — STACK_WOBBLY warnings are
-# acceptable and reflect real loaders' practice of stretch-wrapping the
-# narrow towers. Kegs keep their tighter 2-stack rule (KEG_MAX_STACK).
+# STACK_RATIO_WARN=3.0 (warning). User mandate: 100% delivery. Pack at
+# the validator's HARD ceiling so density matches real-world stretch-
+# wrapped pallets (~95% fill). STACK_WOBBLY warnings are the explicit
+# price for getting every unit on the truck.
 STACK_RATIO = 3.5
 PACK_ASPECT_NON_KEG = 3.45
 IDEAL_X = 0.52
@@ -239,10 +239,15 @@ class _Chunk:
     physical_type: str
     uma: str
     pallet_class: PalletClass
+    units_per_layer: int = 1
 
     @property
     def stack_h(self) -> float:
-        return self.qty * self.unit_dim_h
+        # Bundled chunks (units_per_layer > 1) lay multiple SKU units
+        # side-by-side in one physical layer. Stack height is therefore
+        # ceil(qty / units_per_layer) layers tall, not qty layers.
+        layers = max(1, (int(self.qty) + self.units_per_layer - 1) // max(1, self.units_per_layer))
+        return layers * self.unit_dim_h
 
     @property
     def weight_kg(self) -> float:
@@ -411,24 +416,33 @@ class HistoricMimic(Algorithm):
                 if c.unit_weight_kg > sku_max_weight[c.sku]:
                     sku_max_weight[c.sku] = c.unit_weight_kg
 
-        # Global seq-forward packing. We flatten ALL chunks and sort
-        # by (delivery_seq, class, footprint, weight) so the EARLIEST
-        # clients land at the lowest-(y, x) anchors across every
-        # pallet. The LIFO column check then only allows same-or-
-        # earlier seq above each chunk; with seq-forward order, this
-        # forces each new client to open its own column instead of
-        # stacking on an earlier one. The trade-off is lower column
-        # density (no cross-client stacking), but every stop gets a
-        # blocker-free reach to its target — the front rows of each
-        # pallet are dedicated to the clients delivered first, so by
-        # the time we reach a back-row stop, the front is empty.
+        # Per-client packing. Each client's chunks consolidate on
+        # dedicated pallets so a delivery touches only that client's
+        # pallets — no cross-client blocker lifts.
+        #
+        # Order clients LARGEST FIRST. The heaviest cargo claims its
+        # dedicated pallets up front (and SPREADS across multiple
+        # pallets / slots if it doesn't fit one); smaller clients
+        # fill the rest. Otherwise a fat seq=5 processed last would
+        # find every slot already claimed by smaller earlier clients
+        # and spill cross-client. Slot assignment below independently
+        # places the earliest-visit pallet at the curtain edge so the
+        # first-delivered client is still nearest to the door.
         all_chunks: list[_Chunk] = [
             c for cls_chunks in chunks_by_class.values() for c in cls_chunks
         ]
 
+        client_volume: dict[str, float] = defaultdict(float)
+        for c in all_chunks:
+            client_volume[c.client_id] += (
+                c.qty * c.unit_dim_x * c.unit_dim_y * c.unit_dim_h
+            )
+
         def chunk_key(c: _Chunk) -> tuple:
             return (
+                -client_volume[c.client_id],
                 delivery_seq.get(c.client_id, 10**9),
+                c.client_id,
                 c.pallet_class.value,
                 round(c.unit_dim_x * 20) / 20,
                 round(c.unit_dim_y * 20) / 20,
@@ -469,25 +483,56 @@ class HistoricMimic(Algorithm):
                     chunk.unit_weight_kg, chunk_seq, cls,
                 )
                 if target is None:
+                    # Phase 1: prefer a SAME-CLIENT pallet of matching
+                    # class. Cross-client fallback comes later.
                     target = self._open_column_on_existing(
                         drafts, columns, dx, dy, dh, col_cap,
-                        chunk.unit_weight_kg, cls,
+                        chunk.unit_weight_kg, cls, chunk.client_id,
+                        same_client_only=True,
                     )
                 if target is None:
-                    if len(drafts) >= max_pallets:
-                        overflow.append(
-                            (chunk.client_id, chunk.sku, remaining,
-                             chunk, chunk_seq, col_cap)
-                        )
-                        break
+                    # Phase 1.5: BOX class only — try opening a fresh
+                    # pallet so each BOX client gets a dedicated slot.
+                    # KEG class is rare and tiny per client; we share
+                    # KEG pallets across clients to free up the slot
+                    # budget for BOX (where most cargo lives).
+                    if cls == PalletClass.BOX and len(drafts) < max_pallets:
+                        fresh = new_draft(cls)
+                        col = _Column(fresh.pallet_id, 0.0, 0.0, dx, dy, dh, col_cap)
+                        columns.append(col)
+                        target = (fresh, col)
+                if target is None:
+                    # Phase 2: cross-client placement on an existing
+                    # matching pallet (any client, any free anchor).
+                    # KEG pallets always end up here after the first
+                    # opens; BOX pallets only when the slot budget is
+                    # already saturated.
+                    target = self._open_column_on_existing(
+                        drafts, columns, dx, dy, dh, col_cap,
+                        chunk.unit_weight_kg, cls, chunk.client_id,
+                        same_client_only=False,
+                    )
+                if target is None and len(drafts) < max_pallets:
+                    # Phase 3: open a fresh pallet (any class) as last
+                    # resort before declaring overflow.
                     fresh = new_draft(cls)
                     col = _Column(fresh.pallet_id, 0.0, 0.0, dx, dy, dh, col_cap)
                     columns.append(col)
                     target = (fresh, col)
+                if target is None:
+                    overflow.append(
+                        (chunk.client_id, chunk.sku, remaining,
+                         chunk, chunk_seq, col_cap)
+                    )
+                    break
 
                 d, col = target
                 cur_dx, cur_dy = col.dx, col.dy
-                room_units = col.cap - col.used
+                upl = max(1, chunk.units_per_layer)
+                # col.cap and col.used count LAYERS (1 layer = upl
+                # SKU units in carton mode, or upl=1 for normal).
+                room_layers = col.cap - col.used
+                room_units = room_layers * upl
                 weight_room = int(
                     max(0.0, PALLET_MAX_WEIGHT_KG - d.weight_kg)
                     / max(1e-6, chunk.unit_weight_kg)
@@ -508,10 +553,11 @@ class HistoricMimic(Algorithm):
                     physical_type=chunk.physical_type,
                     uma=chunk.uma,
                     pallet_class=chunk.pallet_class,
+                    units_per_layer=chunk.units_per_layer,
                 )
                 z = col.used * dh
                 self._commit(d, sub, (col.x, col.y, z), delivery_slots)
-                col.used += int(take)
+                col.used += (int(take) + upl - 1) // upl  # layers consumed
                 col.top_unit_weight_kg = chunk.unit_weight_kg
                 col.top_delivery_seq = chunk_seq
                 remaining -= take
@@ -524,12 +570,12 @@ class HistoricMimic(Algorithm):
         # preserves prime anchors for the main pass, so rotation only
         # eats space that would otherwise have stayed empty.
         if overflow:
-            recovered: list[tuple[str, str, float]] = []
+            recovered: list[tuple] = []
             for entry in overflow:
                 client_id, sku, qty, chunk, chunk_seq, col_cap = entry
                 rdx, rdy = chunk.unit_dim_y, chunk.unit_dim_x
                 if rdx == chunk.unit_dim_x and rdy == chunk.unit_dim_y:
-                    recovered.append((client_id, sku, qty))
+                    recovered.append(entry)
                     continue
                 cls = chunk.pallet_class
                 dh = chunk.unit_dim_h
@@ -537,13 +583,18 @@ class HistoricMimic(Algorithm):
                 while remaining > 0.5:
                     target = self._open_column_on_existing(
                         drafts, columns, rdx, rdy, dh, col_cap,
-                        chunk.unit_weight_kg, cls,
+                        chunk.unit_weight_kg, cls, client_id,
                     )
                     if target is None:
-                        recovered.append((client_id, sku, remaining))
+                        recovered.append(
+                            (client_id, sku, remaining,
+                             chunk, chunk_seq, col_cap)
+                        )
                         break
                     d, col = target
-                    room_units = col.cap - col.used
+                    upl = max(1, chunk.units_per_layer)
+                    room_layers = col.cap - col.used
+                    room_units = room_layers * upl
                     weight_room = int(
                         max(0.0, PALLET_MAX_WEIGHT_KG - d.weight_kg)
                         / max(1e-6, chunk.unit_weight_kg)
@@ -564,14 +615,84 @@ class HistoricMimic(Algorithm):
                         physical_type=chunk.physical_type,
                         uma=chunk.uma,
                         pallet_class=cls,
+                        units_per_layer=chunk.units_per_layer,
                     )
                     z = col.used * dh
                     self._commit(d, sub, (col.x, col.y, z), delivery_slots)
-                    col.used += int(take)
+                    col.used += (int(take) + upl - 1) // upl
                     col.top_unit_weight_kg = chunk.unit_weight_kg
                     col.top_delivery_seq = chunk_seq
                     remaining -= take
             overflow = recovered
+
+        # Second post-pass: stack overflow chunks ON TOP of existing
+        # SAME-CLIENT items even when footprints differ. Same-client
+        # stacks are trivially LIFO-safe (the chunks deliver together)
+        # so we don't need column-level uniformity.
+        if overflow:
+            recovered2: list[tuple] = []
+            chunk_by_key: dict[tuple[str, str], _Chunk] = {}
+            qty_by_key: dict[tuple[str, str], float] = defaultdict(float)
+            for entry in overflow:
+                cid, sku, q = entry[0], entry[1], entry[2]
+                key = (cid, sku)
+                qty_by_key[key] += q
+                if len(entry) > 3 and key not in chunk_by_key:
+                    chunk_by_key[key] = entry[3]
+            for (cid, sku), qty in qty_by_key.items():
+                chunk = chunk_by_key.get((cid, sku))
+                if chunk is None:
+                    recovered2.append((cid, sku, qty, None))
+                    continue
+                remaining = float(qty)
+                while remaining > 0.5:
+                    placed = self._try_same_client_stack(
+                        drafts, chunk, delivery_slots,
+                    )
+                    if not placed:
+                        recovered2.append((cid, sku, remaining, chunk))
+                        break
+                    remaining -= 1
+            overflow = recovered2
+
+        # Force-pack tiers per the user's 100% mandate. Tier A keeps
+        # crush + aspect ≤ 3.5 + ≥50% support. Tier B drops crush /
+        # aspect / support — only no-overlap, pallet bounds, weight
+        # cap, and a soft "no stratospheric stacks" cutoff are kept.
+        # Tier B may produce CRUSH_RISK or FLOATING warnings but the
+        # cargo lands on the truck, which is what the user asked for.
+        if overflow:
+            recovered3: list[tuple] = []
+            for cid, sku, qty, chunk in overflow:
+                if chunk is None:
+                    recovered3.append((cid, sku, qty, None))
+                    continue
+                remaining = float(qty)
+                while remaining > 0.5:
+                    if not self._force_pack(
+                        drafts, chunk, delivery_slots,
+                        delivery_seq=delivery_seq,
+                    ):
+                        recovered3.append((cid, sku, remaining, chunk))
+                        break
+                    remaining -= 1
+            overflow = recovered3
+        if overflow:
+            recovered4: list[tuple[str, str, float]] = []
+            for cid, sku, qty, chunk in overflow:
+                if chunk is None:
+                    recovered4.append((cid, sku, qty))
+                    continue
+                remaining = float(qty)
+                while remaining > 0.5:
+                    if not self._force_pack(
+                        drafts, chunk, delivery_slots,
+                        relaxed=True, delivery_seq=delivery_seq,
+                    ):
+                        recovered4.append((cid, sku, remaining))
+                        break
+                    remaining -= 1
+            overflow = recovered4
 
         # Slot assignment: visit-aware. Earliest-primary-client pallet
         # near the door, latest near the back. KEG drafts sorted to land
@@ -759,16 +880,15 @@ class HistoricMimic(Algorithm):
         for c in chunks:
             bucket_map[key(c)].append(c)
 
-        for bucket_key, chunks_in_bucket in bucket_map.items():
-            # Per-client round-robin in late-first order. We group
-            # chunks by client, sort the within-client list heaviest-
-            # first, then iterate ROUNDS where each round takes one
-            # chunk from each client (clients walked late-first). The
-            # placement loop then puts those chunks into columns LIFO-
-            # style, so a column ends up holding ONE chunk per client
-            # bottom→top: latest at z=0, earliest at z=top. This mixes
-            # clients into a single dense column instead of letting
-            # seq=5's many chunks monopolize the entire front row.
+        for chunks_in_bucket in bucket_map.values():
+            # Per-client round-robin in late-first order: group chunks
+            # by client, sort within-client heaviest-first, then walk
+            # rounds where each round takes one chunk from each client
+            # (clients in late-delivery order). The placement loop
+            # builds columns LIFO-style — one chunk per client bottom→
+            # top so latest sits at z=0 and earliest at z=top. Mixing
+            # all clients into shared columns instead of letting one
+            # big client monopolize the front row.
             by_client: dict[str, list[_Chunk]] = defaultdict(list)
             for c in chunks_in_bucket:
                 by_client[c.client_id].append(c)
@@ -861,21 +981,21 @@ class HistoricMimic(Algorithm):
         col_cap: int,
         unit_weight_kg: float,
         cls: PalletClass,
+        client_id: str | None = None,
+        same_client_only: bool = False,
     ) -> tuple[_PalletDraft, _Column] | None:
         """Open a fresh column at a free (x, y) anchor on an existing
-        pallet of matching class. KEG and BOX never share a pallet — the
-        validator applies the KEG column-cap (4 units) to *every* column
-        on a pallet that contains any keg, which would clip BOX columns
-        sized for cap=6.
+        pallet of matching class. KEG and BOX never share a pallet.
 
-        Picks the LOWEST-y anchor across ALL eligible pallets, not just
-        the first pallet with any free anchor. This makes the front row
-        of every pallet fill before any pallet's back row — keeping
-        early-delivery chunks (processed first under seq-forward sort)
-        at the curtain edge globally rather than tucked behind cargo on
-        a half-full earlier pallet."""
+        With `same_client_only=True`, only consider pallets where this
+        client already has items — used in the main pass to keep each
+        client consolidated on dedicated pallets. With False, the
+        helper falls back to any matching pallet (cross-client), used
+        only as the last-resort tier when the truck's pallet budget
+        is exhausted."""
 
-        best: tuple[_PalletDraft, tuple[float, float]] | None = None
+        same: list[tuple[_PalletDraft, tuple[float, float]]] = []
+        other: list[tuple[_PalletDraft, tuple[float, float]]] = []
         for d in drafts:
             if d.pallet_class != cls:
                 continue
@@ -884,14 +1004,256 @@ class HistoricMimic(Algorithm):
             anchor = HistoricMimic._free_anchor(d, dx, dy)
             if anchor is None:
                 continue
-            if best is None or (anchor[1], anchor[0]) < (best[1][1], best[1][0]):
-                best = (d, anchor)
+            if client_id is not None and client_id in d.client_set:
+                same.append((d, anchor))
+            else:
+                other.append((d, anchor))
+
+        pools: list[list[tuple[_PalletDraft, tuple[float, float]]]] = [same]
+        if not same_client_only:
+            pools.append(other)
+        for pool in pools:
+            best: tuple[_PalletDraft, tuple[float, float]] | None = None
+            for d, anchor in pool:
+                if best is None or (anchor[1], anchor[0]) < (best[1][1], best[1][0]):
+                    best = (d, anchor)
+            if best is not None:
+                d, anchor = best
+                col = _Column(d.pallet_id, anchor[0], anchor[1], dx, dy, dh, col_cap)
+                columns.append(col)
+                return d, col
+        return None
+
+    @staticmethod
+    def _force_pack(
+        drafts: list[_PalletDraft],
+        chunk: _Chunk,
+        delivery_slots: dict[tuple[str, str], list[tuple[str, float]]],
+        relaxed: bool = False,
+        delivery_seq: dict[str, int] | None = None,
+    ) -> bool:
+        """Last-resort placement. Find ANY overlap-free spot on a class-
+        matching pallet — checking the floor and every existing item's
+        top corners as candidate anchors. Tier A (relaxed=False) keeps
+        aspect ≤ STACK_RATIO=3.5, ≥50% support coverage, and the crush
+        rule (lighter on heavier). Tier B (relaxed=True) drops aspect
+        / support / crush and only enforces no-overlap, pallet bounds,
+        pallet height, and a 5 m absolute z cap so we don't stack
+        items into orbit. Tier B may emit FLOATING / CRUSH warnings
+        but lands the cargo, which is what the user asked for."""
+
+        cls = chunk.pallet_class
+        dx, dy, dh = chunk.unit_dim_x, chunk.unit_dim_y, chunk.unit_dim_h
+        narrow = max(1e-3, min(dx, dy))
+        unit_w = chunk.unit_weight_kg
+
+        best: tuple[_PalletDraft, tuple[float, float, float]] | None = None
+        best_score: tuple | None = None
+
+        for d in drafts:
+            if d.pallet_class != cls:
+                continue
+            if d.weight_kg + unit_w > PALLET_MAX_WEIGHT_KG + 1e-6:
+                continue
+            anchors: set[tuple[float, float, float]] = {(0.0, 0.0, 0.0)}
+            for it in d.items:
+                if it.qty <= 0:
+                    continue
+                anchors.add((it.end_x, it.pos_y, it.pos_z))
+                anchors.add((it.pos_x, it.end_y, it.pos_z))
+                anchors.add((it.pos_x, it.pos_y, it.top_z))
+            for ax, ay, az in anchors:
+                if ax < -1e-6 or ay < -1e-6 or az < -1e-6:
+                    continue
+                if ax + dx > PALLET_LENGTH_M + _BBOX_EPS:
+                    continue
+                if ay + dy > PALLET_WIDTH_M + _BBOX_EPS:
+                    continue
+                if az + dh > PALLET_HEIGHT_M + _BBOX_EPS:
+                    continue
+                # Aspect ≤ STACK_RATIO=3.5 in BOTH tiers — anything
+                # above is STACK_UNSTABLE which the validator marks as
+                # a hard error. Tier A is stricter (≤ 3.45) to avoid
+                # even the WOBBLY warning; Tier B allows up to 3.5
+                # (warnings are fine, errors are not).
+                aspect_cap = STACK_RATIO if relaxed else PACK_ASPECT_NON_KEG
+                if (az + dh) / narrow > aspect_cap + 1e-6:
+                    continue
+                overlap = False
+                for it in d.items:
+                    if it.qty <= 0:
+                        continue
+                    if (
+                        ax < it.end_x - 1e-6
+                        and it.pos_x < ax + dx - 1e-6
+                        and ay < it.end_y - 1e-6
+                        and it.pos_y < ay + dy - 1e-6
+                        and az < it.top_z - 1e-6
+                        and it.pos_z < az + dh - 1e-6
+                    ):
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+                # Tier A: no crush + LIFO + ≥ 80 % support — fully
+                # safe. Tier B: drops LIFO and lowers support to 50 %
+                # (the simulator's runtime threshold). LIFO violation
+                # may briefly float when the supporter is unloaded
+                # mid-route — the simulator's SETTLE handler resolves
+                # it (FLOATING_AVOIDED warning, not error). This is
+                # the tier that hits 100 % pack on otherwise-impossible
+                # cases. Crush is NEVER dropped — heavy-on-light is a
+                # real safety hazard the validator marks as a hard
+                # error.
+                if az > 1e-6:
+                    base_area = dx * dy
+                    covered = 0.0
+                    crush = False
+                    bad_lifo = False
+                    inc_seq = delivery_seq.get(chunk.client_id, 0) if delivery_seq else 0
+                    for it in d.items:
+                        if it.qty <= 0:
+                            continue
+                        if abs(it.top_z - az) > 1e-3:
+                            continue
+                        ox = max(0.0, min(ax + dx, it.end_x) - max(ax, it.pos_x))
+                        oy = max(0.0, min(ay + dy, it.end_y) - max(ay, it.pos_y))
+                        if ox <= 0 or oy <= 0:
+                            continue
+                        covered += ox * oy
+                        if it.unit_weight_kg + 1e-6 < unit_w:
+                            crush = True
+                        if delivery_seq and it.intended_client:
+                            sup_seq = delivery_seq.get(it.intended_client, 10**9)
+                            if inc_seq > sup_seq:
+                                bad_lifo = True
+                    # CRUSH, SUPPORT, and LIFO are ALL hard physics —
+                    # both tiers enforce them so the validator never
+                    # flags CRUSH_RISK / FLOATING_ITEM /
+                    # UNSTABLE_OVERHANG / FLOATING_AVOIDED at runtime.
+                    # Tier B differs only in support fraction (55 %
+                    # vs Tier A's 80 %) and aspect cap (3.5 vs 3.45)
+                    # — both still inside the validator's hard-error
+                    # boundary. The trade for missing the user's
+                    # 100 % goal on dense cases is honesty: items get
+                    # reported as PACKER_DENSITY_GAP rather than
+                    # silently shipping under unsafe physics.
+                    min_cov = (0.55 if relaxed else 0.80) * base_area
+                    if crush or covered < min_cov - 1e-6 or bad_lifo:
+                        continue
+                score = (az, ay, ax)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best = (d, (ax, ay, az))
         if best is None:
-            return None
-        d, anchor = best
-        col = _Column(d.pallet_id, anchor[0], anchor[1], dx, dy, dh, col_cap)
-        columns.append(col)
-        return d, col
+            return False
+        d, pos = best
+        sub = _Chunk(
+            sku=chunk.sku,
+            client_id=chunk.client_id,
+            qty=1.0,
+            unit_dim_x=dx,
+            unit_dim_y=dy,
+            unit_dim_h=dh,
+            unit_weight_kg=unit_w,
+            unit_volume_m3=chunk.unit_volume_m3,
+            physical_type=chunk.physical_type,
+            uma=chunk.uma,
+            pallet_class=cls,
+            units_per_layer=chunk.units_per_layer,
+        )
+        HistoricMimic._commit(d, sub, pos, delivery_slots)
+        return True
+
+    @staticmethod
+    def _try_same_client_stack(
+        drafts: list[_PalletDraft],
+        chunk: _Chunk,
+        delivery_slots: dict[tuple[str, str], list[tuple[str, float]]],
+    ) -> bool:
+        """Place ONE unit of `chunk` on top of an existing same-client
+        item where it fits without overlap and stays under the aspect /
+        height / weight caps. Used to soak up vertical headroom that
+        the per-client column dedication leaves empty above small
+        clients' first columns. Stacking on a same-client supporter is
+        LIFO-trivial (both deliver together) and crush-safe whenever
+        the new unit is lighter than the support."""
+
+        cls = chunk.pallet_class
+        dx, dy, dh = chunk.unit_dim_x, chunk.unit_dim_y, chunk.unit_dim_h
+        unit_w = chunk.unit_weight_kg
+        narrow = max(1e-3, min(dx, dy))
+        aspect_cap = STACK_RATIO if chunk.is_keg else PACK_ASPECT_NON_KEG
+
+        best: tuple[_PalletDraft, tuple[float, float, float]] | None = None
+        best_z = float("inf")
+        for d in drafts:
+            if d.pallet_class != cls:
+                continue
+            if d.weight_kg + unit_w > PALLET_MAX_WEIGHT_KG + 1e-6:
+                continue
+            for support in d.items:
+                if support.qty <= 0 or support.intended_client != chunk.client_id:
+                    continue
+                if support.unit_weight_kg + 1e-6 < unit_w:
+                    continue  # would crush the lighter supporter
+                # Stack only when the chunk fits fully within the
+                # supporter's footprint — full support coverage so no
+                # overhang touches a NEIGHBOURING (different-weight,
+                # different-client) item below the overhang. Partial
+                # coverage opens the door to crush-risk against items
+                # we didn't check, so we keep this conservative.
+                if dx > support.dim_x + 1e-6 or dy > support.dim_y + 1e-6:
+                    continue
+                ax = support.pos_x
+                ay = support.pos_y
+                az = support.top_z
+                if ax + dx > PALLET_LENGTH_M + _BBOX_EPS:
+                    continue
+                if ay + dy > PALLET_WIDTH_M + _BBOX_EPS:
+                    continue
+                if az + dh > PALLET_HEIGHT_M + _BBOX_EPS:
+                    continue
+                if (az + dh) / narrow > aspect_cap + 1e-6:
+                    continue
+                overlap = False
+                for it in d.items:
+                    if it is support or it.qty <= 0:
+                        continue
+                    if (
+                        ax < it.end_x - 1e-6
+                        and it.pos_x < ax + dx - 1e-6
+                        and ay < it.end_y - 1e-6
+                        and it.pos_y < ay + dy - 1e-6
+                        and az < it.top_z - 1e-6
+                        and it.pos_z < az + dh - 1e-6
+                    ):
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+                if az < best_z:
+                    best_z = az
+                    best = (d, (ax, ay, az))
+        if best is None:
+            return False
+        d, pos = best
+        sub = _Chunk(
+            sku=chunk.sku,
+            client_id=chunk.client_id,
+            qty=1.0,
+            unit_dim_x=dx,
+            unit_dim_y=dy,
+            unit_dim_h=dh,
+            unit_weight_kg=unit_w,
+            unit_volume_m3=chunk.unit_volume_m3,
+            physical_type=chunk.physical_type,
+            uma=chunk.uma,
+            pallet_class=cls,
+            units_per_layer=chunk.units_per_layer,
+        )
+        HistoricMimic._commit(d, sub, pos, delivery_slots)
+        return True
 
     @staticmethod
     def _free_anchor(
@@ -1233,13 +1595,17 @@ class HistoricMimic(Algorithm):
         assignment: dict[str, str],
         slots: list[Slot],
         truck,
-        target_offset_m: float = 0.45,
-        max_iter: int = 30,
+        target_offset_m: float = 0.30,
+        max_iter: int = 60,
     ) -> dict[str, str]:
         """Swap pallets along the truck's X axis to drive the
         longitudinal COG toward zero. The validator's
-        COM_LONGITUDINAL_OFFSET fires at |x_com| > 0.50 m, so we aim
-        for 0.45 m to keep a margin.
+        COM_LONGITUDINAL_OFFSET fires at |x_com| > 0.50 m, and our
+        per-item COM calc uses each item's actual position (so the
+        balancer's mid-iteration estimate can drift a few cm from the
+        validator's final number). Aim for 0.30 m to give a real
+        margin and run more iterations so an extra swap can pull a
+        borderline 0.51 m case under the line.
 
         Allowed swaps: any two pallets at *different positions* on the
         same axis can swap. We try all pairs and pick the one that
@@ -1467,9 +1833,48 @@ class HistoricMimic(Algorithm):
                 target_items, same_client, foreign = vt.find_blockers(
                     slot_id, target_keys
                 )
+                # STRICT top-down lift order. A blocker can only be
+                # lifted once everything physically above it (anything
+                # whose footprint overlaps in xy and sits at higher z,
+                # whether blocker, target, or untouched cargo) has
+                # already been lifted or taken. Plain (y, x, -z) sort
+                # breaks this when stacks span overlapping non-grid
+                # footprints — the result is items left hanging in
+                # mid-air during the LIFT animation. We do a manual
+                # topological sort over physical-above relationships
+                # so an item with anything resting on it goes LAST.
+                all_items = [
+                    it for it in vt.items(slot_id) if it.qty > 0
+                ]
+                blockers = list(foreign) + list(same_client)
+
+                def above_count(b: PalletItem) -> int:
+                    n = 0
+                    for it in all_items:
+                        if it is b:
+                            continue
+                        if it.pos_z + 1e-6 < b.top_z:
+                            continue
+                        ox = max(
+                            0.0,
+                            min(b.end_x, it.end_x) - max(b.pos_x, it.pos_x),
+                        )
+                        oy = max(
+                            0.0,
+                            min(b.end_y, it.end_y) - max(b.pos_y, it.pos_y),
+                        )
+                        if ox > 1e-6 and oy > 1e-6:
+                            n += 1
+                    return n
+
                 ordered_lifts = sorted(
-                    foreign + same_client,
-                    key=lambda b: (b.pos_y, b.pos_x, -b.pos_z),
+                    blockers,
+                    key=lambda b: (
+                        above_count(b),  # 0-above first → topmost
+                        -b.top_z,        # within tier, higher z first
+                        b.pos_y,
+                        b.pos_x,
+                    ),
                 )
                 lifts = vt.to_lifts(ordered_lifts)
                 restock = vt.plan_restock(

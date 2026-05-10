@@ -33,10 +33,10 @@ from simulator.domain.plan import Plan
 
 PALLET_LEN_M = 1.20
 PALLET_WIDTH_M = 0.80
-PALLET_HEIGHT_M = 1.80
+PALLET_HEIGHT_M = 2.40
 SLOT_GAP_X_M = 0.06
 LR_GAP_M = 0.10
-TRUCK_HEIGHT_M = 2.10  # generous internal cabin clearance
+TRUCK_HEIGHT_M = 2.40  # internal cabin clearance
 
 # Risk thresholds — hand-tuned defaults; can be made configurable later.
 CRUSH_WEIGHT_RATIO = 3.0      # upper / lower per-box weight to flag

@@ -29,7 +29,7 @@ from math import ceil
 
 PALLET_LENGTH_M = 1.20
 PALLET_WIDTH_M = 0.80
-PALLET_HEIGHT_M = 1.80
+PALLET_HEIGHT_M = 2.40
 
 # Logical cell sizes used only to derive legacy col_x/col_y/level coordinates
 # from continuous positions for backwards compatibility with existing events.

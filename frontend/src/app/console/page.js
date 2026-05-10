@@ -4,13 +4,11 @@ import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import TruckPanel from "@/components/TruckPanel";
 import CopilotPanel from "@/components/CopilotPanel";
-import MetricsBar from "@/components/MetricsBar";
 
 import { api, SIM_API_BASE } from "@/lib/api";
 import {
   adaptStops,
   adaptPallets,
-  adaptMetrics,
   adaptDepot,
   adaptTruck,
 } from "@/lib/adapters";
@@ -21,7 +19,6 @@ const SECTIONS = [
   { id: "map", index: "01", title: "Route" },
   { id: "truck", index: "02", title: "Load" },
   { id: "copilot", index: "03", title: "Co-pilot" },
-  { id: "metrics", index: "—", title: "Metrics" },
 ];
 
 function Section({
@@ -190,11 +187,13 @@ export default function Page() {
         const algoList = algos?.algorithms || [];
         setAlgorithms(algoList);
         if (algoList.length > 0) {
-          setSelectedAlgo(algoList[0].name);
+          const preferredAlgo =
+            algoList.find((a) => a.name === "historic") || algoList[0];
+          setSelectedAlgo(preferredAlgo.name);
           pushLog({
             tag: "ALGO",
             level: "info",
-            msg: `SELECTED · ${algoList[0].name.toUpperCase()}`,
+            msg: `SELECTED · ${preferredAlgo.name.toUpperCase()}`,
           });
         }
       })
@@ -298,9 +297,9 @@ export default function Page() {
 
   const appGridStyle = useMemo(
     () => ({
-      gridTemplateRows: `22px 50px 1fr ${collapsed.has("metrics") ? "0" : "160px"} 26px`,
+      gridTemplateRows: "22px 50px 1fr 26px",
     }),
-    [collapsed],
+    [],
   );
 
   const handleColDrag = useCallback(
@@ -365,11 +364,6 @@ export default function Page() {
     () => (simulationResult ? adaptTruck(simulationResult) : null),
     [simulationResult],
   );
-  const kpis = useMemo(
-    () => (simulationResult ? adaptMetrics(simulationResult) : null),
-    [simulationResult],
-  );
-
   const filledPallets = pallets.filter((p) => p.sku);
   const returnableCount = filledPallets.length
     ? Math.round(
@@ -377,6 +371,224 @@ export default function Page() {
           100,
       )
     : 0;
+
+  const applyUiActions = useCallback(
+    (actions = []) => {
+      if (!Array.isArray(actions) || actions.length === 0) return;
+
+      for (const rawAction of actions.slice(0, 4)) {
+        const action = rawAction?.action;
+        if (!action) continue;
+
+        if (action === "select_route") {
+          const r = availableRoutes.find(
+            (route) =>
+              route.fecha === rawAction.date && route.ruta === rawAction.ruta,
+          );
+          if (r) {
+            setSelectedRoute(r);
+            pushOperatorAction({
+              type: "copilot_select_route",
+              route: `${r.fecha} ${r.ruta}`,
+            });
+          }
+          continue;
+        }
+
+        if (action === "select_algorithm") {
+          const algorithm = String(rawAction.algorithm || "");
+          const exists = algorithms.some((algo) => algo.name === algorithm);
+          if (exists) {
+            setSelectedAlgo(algorithm);
+            pushOperatorAction({
+              type: "copilot_select_algorithm",
+              route: selectedRoute
+                ? `${selectedRoute.fecha} ${selectedRoute.ruta}`
+                : null,
+              algorithm,
+            });
+          }
+          continue;
+        }
+
+        if (action === "focus_stop") {
+          const stopId = Number(rawAction.stop_id);
+          const stop = stops.find((s) => s.id === stopId);
+          if (stop) {
+            setSelectedClient(stop);
+            setHoveredStop(stop);
+            setSelectedPallet(null);
+            pushOperatorAction({
+              type: "copilot_focus_stop",
+              route: selectedRoute
+                ? `${selectedRoute.fecha} ${selectedRoute.ruta}`
+                : null,
+              stop_id: stop.id,
+              client_id: stop.client_id,
+              label: stop.name,
+            });
+          }
+          continue;
+        }
+
+        if (action === "focus_client") {
+          const clientId = String(rawAction.client_id || "");
+          const stop = stops.find((s) => s.client_id === clientId);
+          if (stop) {
+            setSelectedClient(stop);
+            setHoveredStop(stop);
+            setSelectedPallet(null);
+            pushOperatorAction({
+              type: "copilot_focus_client",
+              route: selectedRoute
+                ? `${selectedRoute.fecha} ${selectedRoute.ruta}`
+                : null,
+              client_id: stop.client_id,
+              stop_id: stop.id,
+              label: stop.name,
+            });
+          }
+          continue;
+        }
+
+        if (action === "clear_selection") {
+          setSelectedClient(null);
+          setSelectedPallet(null);
+          setHoveredStop(null);
+          setHoveredPallet(null);
+          pushOperatorAction({
+            type: "copilot_clear_selection",
+            route: selectedRoute
+              ? `${selectedRoute.fecha} ${selectedRoute.ruta}`
+              : null,
+          });
+          continue;
+        }
+
+        if (action === "open_panel") {
+          const panel = String(rawAction.panel || "");
+          if (panel) {
+            setCollapsed((prev) => {
+              const next = new Set(prev);
+              next.delete(panel);
+              return next;
+            });
+            pushOperatorAction({
+              type: "copilot_open_panel",
+              panel,
+            });
+          }
+          continue;
+        }
+
+        if (action === "close_panel") {
+          const panel = String(rawAction.panel || "");
+          if (panel) {
+            setCollapsed((prev) => {
+              const next = new Set(prev);
+              next.add(panel);
+              return next;
+            });
+            if (fullscreenPanel === panel) {
+              setFullscreenPanel(null);
+            }
+            pushOperatorAction({
+              type: "copilot_close_panel",
+              panel,
+            });
+          }
+          continue;
+        }
+
+        if (action === "set_fullscreen_panel") {
+          setFullscreenPanel(rawAction.panel || null);
+          pushOperatorAction({
+            type: "copilot_set_fullscreen_panel",
+            panel: rawAction.panel || null,
+          });
+          continue;
+        }
+
+        if (action === "set_panel_collapsed") {
+          const panel = String(rawAction.panel || "");
+          const collapsedNext = Boolean(rawAction.collapsed);
+          if (panel) {
+            setCollapsed((prev) => {
+              const next = new Set(prev);
+              if (collapsedNext) next.add(panel);
+              else next.delete(panel);
+              return next;
+            });
+            if (!collapsedNext) {
+              setFullscreenPanel((prev) => prev);
+            }
+            pushOperatorAction({
+              type: "copilot_set_panel_collapsed",
+              panel,
+              collapsed: collapsedNext,
+            });
+          }
+          continue;
+        }
+
+        if (action === "set_panel_menu_open") {
+          setPanelMenuOpen(Boolean(rawAction.open));
+          pushOperatorAction({
+            type: "copilot_set_panel_menu_open",
+            open: Boolean(rawAction.open),
+          });
+          continue;
+        }
+
+        if (action === "set_pdf_menu_open") {
+          setPdfMenuOpen(Boolean(rawAction.open));
+          pushOperatorAction({
+            type: "copilot_set_pdf_menu_open",
+            open: Boolean(rawAction.open),
+          });
+          continue;
+        }
+
+        if (action === "open_document") {
+          if (!selectedRoute) continue;
+          const document = String(rawAction.document || "");
+          if (document === "hoja_carga") {
+            openPdf(
+              `/pdf/hoja-carga/${selectedRoute.fecha}/${selectedRoute.ruta}`,
+            );
+          } else if (document === "hoja_ruta") {
+            openPdf(
+              `/pdf/hoja-ruta/${selectedRoute.fecha}/${selectedRoute.ruta}`,
+            );
+          } else if (document === "albaran") {
+            const clientId = String(
+              rawAction.client_id || selectedClient?.client_id || "",
+            );
+            if (!clientId) continue;
+            openPdf(
+              `/pdf/albaran/${selectedRoute.fecha}/${selectedRoute.ruta}/${clientId}`,
+            );
+          }
+          pushOperatorAction({
+            type: "copilot_open_document",
+            route: `${selectedRoute.fecha} ${selectedRoute.ruta}`,
+            document,
+            client_id: rawAction.client_id || selectedClient?.client_id || null,
+          });
+        }
+      }
+    },
+    [
+      algorithms,
+      availableRoutes,
+      fullscreenPanel,
+      openPdf,
+      pushOperatorAction,
+      selectedClient,
+      selectedRoute,
+      stops,
+    ],
+  );
 
   const buildCopilotContext = useCallback(
     (overrides = {}) => {
@@ -455,7 +667,6 @@ export default function Page() {
           error,
           simulation_ready: Boolean(simulationResult),
         },
-        kpis: kpis?.all || null,
         visible_stops: stops.map((s) => ({
           id: s.id,
           code: s.code,
@@ -492,7 +703,6 @@ export default function Page() {
       loading,
       error,
       simulationResult,
-      kpis,
       stops,
       pallets,
       filledPallets.length,
@@ -525,17 +735,28 @@ export default function Page() {
           messages: outgoingMessages,
           frontendContext: buildCopilotContext(contextOverrides),
         });
+        applyUiActions(response.ui_actions || []);
         setMessages((prev) => [
           ...prev,
           { kind: "claude", text: response.reply || "" },
         ]);
         const tools = response.tool_calls?.map((t) => t.name).filter(Boolean);
+        const uiActionCount = Array.isArray(response.ui_actions)
+          ? response.ui_actions.length
+          : 0;
         pushLog({
           tag: "COPILOT",
           level: "ok",
-          msg: tools?.length
-            ? `TOOLS · ${tools.join(", ").toUpperCase()}`
-            : `MODEL · ${response.model}`,
+          msg: [
+            tools?.length
+              ? `TOOLS · ${tools.join(", ").toUpperCase()}`
+              : `MODEL · ${response.model}`,
+            uiActionCount
+              ? `UI · ${uiActionCount} ACTION${uiActionCount > 1 ? "S" : ""}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" · "),
         });
       } catch (err) {
         const detail =
@@ -553,7 +774,7 @@ export default function Page() {
         setIsTyping(false);
       }
     },
-    [buildCopilotContext, isTyping, messages, pushLog],
+    [applyUiActions, buildCopilotContext, isTyping, messages, pushLog],
   );
 
   const hoveredPalletStops = hoveredPallet ? [hoveredPallet.stop] : [];
@@ -949,22 +1170,6 @@ export default function Page() {
           </div>
         )}
       </main>
-
-      <Section
-        id="metrics"
-        collapsed={collapsed.has("metrics")}
-        fullscreen={fullscreenPanel === "metrics"}
-        onToggleCollapse={toggleCollapse}
-        onToggleFullscreen={toggleFullscreen}
-        dark
-      >
-        <MetricsBar
-          kpis={kpis}
-          fullscreen={fullscreenPanel === "metrics"}
-          routeDetail={routeDetail}
-          simStops={stops}
-        />
-      </Section>
 
       <footer className="footer">
         <span>DDI SMART TRUCK &middot; PLANNING CONSOLE &middot; v0.5</span>

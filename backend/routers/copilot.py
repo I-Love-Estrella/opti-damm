@@ -32,6 +32,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    ui_actions: list[dict[str, Any]] = Field(default_factory=list)
     model: str
 
 
@@ -42,9 +43,46 @@ context, which may include selected route, selected stop, load mode, truck type,
 visible stops, pallets, and system log. Treat frontend context as current UI state, and
 backend tools as source-of-truth for route/order/client/simulator data.
 
+You have BOTH data tools and one UI-control tool:
+- Data tools: get_frontend_context, list_routes, get_route_detail, list_clients,
+  get_client, list_algorithms, list_trucks, list_days, run_simulation,
+  benchmark_algorithms, compare_algorithms.
+- UI tool: request_ui_action.
+
+You ARE able to modify a limited, allowlisted subset of the dispatcher UI by using the
+request_ui_action tool. Supported UI changes include selecting a route, selecting an
+algorithm, focusing a visible stop or client, opening menus, toggling panel collapse,
+opening or closing panels, clearing selection, opening route documents, and setting
+fullscreen. If the user asks whether you can modify the UI, answer yes, and explain that
+you can only change supported UI state through allowlisted actions.
+
+Use natural-language panel aliases:
+- route, map, route panel -> panel `map`
+- load, truck, load panel, truck panel -> panel `truck`
+- copilot, co-pilot, chat -> panel `copilot`
+- metrics, KPI bar, stats -> panel `metrics`
+
+When the user says hide, close, show, open, expand, collapse, or fullscreen for one of
+those panels, use request_ui_action instead of saying the UI must be changed manually.
+
+Examples:
+- User: "hide the map panel"
+  -> call request_ui_action with {"action": "close_panel", "panel": "map"}
+- User: "open truck"
+  -> call request_ui_action with {"action": "open_panel", "panel": "truck"}
+- User: "collapse metrics"
+  -> call request_ui_action with {"action": "set_panel_collapsed", "panel": "metrics", "collapsed": true}
+- User: "can you modify ui?"
+  -> answer yes, explain the allowlisted UI actions, and do not claim that all UI changes are manual-only.
+- User: "list all your tools"
+  -> include request_ui_action in the list.
+
 Keep answers concise and actionable. Mention route IDs, client names, quantities, windows,
-or algorithm names when relevant. If a requested action is outside the available tools,
-say what data you can inspect and what would still require an operator action."""
+or algorithm names when relevant. If the user asks you to change the UI, use the
+request_ui_action tool for allowlisted UI mutations whenever possible. Do not claim that
+all UI changes are manual-only. Do not invent unsupported UI actions. If a requested
+action is outside the available tools, say what data you can inspect and what would still
+require an operator action."""
 
 
 TOOL_DECLARATIONS: list[dict[str, Any]] = [
@@ -52,6 +90,56 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "name": "get_frontend_context",
         "description": "Returns the current dispatcher-console UI state sent by the browser.",
         "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "request_ui_action",
+        "description": "Requests one allowlisted UI change in the dispatcher console. Supported actions: select_route, select_algorithm, focus_stop, focus_client, clear_selection, open_panel, close_panel, set_fullscreen_panel, set_panel_collapsed, set_panel_menu_open, set_pdf_menu_open, open_document. Natural language aliases: route or map means panel=map, load or truck means panel=truck, copilot or chat means panel=copilot, metrics or KPI bar means panel=metrics.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Allowlisted UI action name.",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Route date for select_route.",
+                },
+                "ruta": {
+                    "type": "string",
+                    "description": "Route code for select_route.",
+                },
+                "algorithm": {
+                    "type": "string",
+                    "description": "Algorithm id for select_algorithm.",
+                },
+                "stop_id": {
+                    "type": "integer",
+                    "description": "Visible stop id for focus_stop.",
+                },
+                "client_id": {
+                    "type": "string",
+                    "description": "Client id for focus_client or open_document albaran.",
+                },
+                "panel": {
+                    "type": "string",
+                    "description": "Panel id for open_panel, close_panel, set_fullscreen_panel, or set_panel_collapsed: map, truck, copilot, metrics.",
+                },
+                "collapsed": {
+                    "type": "boolean",
+                    "description": "Whether the panel should be collapsed for set_panel_collapsed.",
+                },
+                "open": {
+                    "type": "boolean",
+                    "description": "Whether the menu should be open for set_panel_menu_open or set_pdf_menu_open.",
+                },
+                "document": {
+                    "type": "string",
+                    "description": "Document to open: hoja_carga, hoja_ruta, or albaran.",
+                },
+            },
+            "required": ["action"],
+        },
     },
     {
         "name": "list_routes",
@@ -318,6 +406,127 @@ def _client_out(client: Any) -> dict[str, Any]:
     }
 
 
+def _validate_ui_action(
+    args: dict[str, Any], frontend_context: dict[str, Any]
+) -> dict[str, Any]:
+    action = str(args.get("action") or "").strip()
+    if not action:
+        raise ValueError("UI action name is required")
+
+    allowed_actions = {
+        "select_route",
+        "select_algorithm",
+        "focus_stop",
+        "focus_client",
+        "clear_selection",
+        "open_panel",
+        "close_panel",
+        "set_fullscreen_panel",
+        "set_panel_collapsed",
+        "set_panel_menu_open",
+        "set_pdf_menu_open",
+        "open_document",
+    }
+    if action not in allowed_actions:
+        raise ValueError(f"Unsupported UI action: {action}")
+
+    if action == "select_route":
+        date = str(args.get("date") or "").strip()
+        ruta = str(args.get("ruta") or "").strip()
+        if not date or not ruta:
+            raise ValueError("select_route requires date and ruta")
+        return {"action": action, "date": date, "ruta": ruta}
+
+    if action == "select_algorithm":
+        algorithm = str(args.get("algorithm") or "").strip()
+        if not algorithm:
+            raise ValueError("select_algorithm requires algorithm")
+        return {"action": action, "algorithm": algorithm}
+
+    if action == "focus_stop":
+        stop_id = args.get("stop_id")
+        if stop_id is None:
+            raise ValueError("focus_stop requires stop_id")
+        visible_stops = frontend_context.get("visible_stops") or []
+        visible_ids = {
+            int(s.get("id")) for s in visible_stops if s.get("id") is not None
+        }
+        stop_id = int(stop_id)
+        if visible_ids and stop_id not in visible_ids:
+            raise ValueError(
+                f"Stop {stop_id} is not visible in the current frontend context"
+            )
+        return {"action": action, "stop_id": stop_id}
+
+    if action == "focus_client":
+        client_id = str(args.get("client_id") or "").strip()
+        if not client_id:
+            raise ValueError("focus_client requires client_id")
+        visible_stops = frontend_context.get("visible_stops") or []
+        visible_client_ids = {
+            str(s.get("client_id")) for s in visible_stops if s.get("client_id")
+        }
+        if visible_client_ids and client_id not in visible_client_ids:
+            raise ValueError(
+                f"Client {client_id} is not visible in the current frontend context"
+            )
+        return {"action": action, "client_id": client_id}
+
+    if action == "clear_selection":
+        return {"action": action}
+
+    allowed_panels = {"map", "truck", "copilot", "metrics"}
+
+    if action in {"open_panel", "close_panel"}:
+        panel = str(args.get("panel") or "").strip()
+        if panel not in allowed_panels:
+            raise ValueError(f"Unsupported panel: {panel}")
+        return {"action": action, "panel": panel}
+
+    if action == "set_fullscreen_panel":
+        panel = args.get("panel")
+        panel = None if panel is None else str(panel).strip()
+        if panel is not None and panel not in allowed_panels:
+            raise ValueError(f"Unsupported panel: {panel}")
+        return {"action": action, "panel": panel}
+
+    if action == "set_panel_collapsed":
+        panel = str(args.get("panel") or "").strip()
+        if panel not in allowed_panels:
+            raise ValueError(f"Unsupported panel: {panel}")
+        collapsed = args.get("collapsed")
+        if collapsed is None:
+            raise ValueError("set_panel_collapsed requires collapsed=true/false")
+        return {"action": action, "panel": panel, "collapsed": bool(collapsed)}
+
+    if action in {"set_panel_menu_open", "set_pdf_menu_open"}:
+        open_value = args.get("open")
+        if open_value is None:
+            raise ValueError(f"{action} requires open=true/false")
+        return {"action": action, "open": bool(open_value)}
+
+    if action == "open_document":
+        document = str(args.get("document") or "").strip()
+        if document not in {"hoja_carga", "hoja_ruta", "albaran"}:
+            raise ValueError(
+                "open_document requires document=hoja_carga|hoja_ruta|albaran"
+            )
+        payload = {"action": action, "document": document}
+        if document == "albaran":
+            client_id = str(args.get("client_id") or "").strip()
+            if not client_id:
+                selected_stop = frontend_context.get("selected_stop") or {}
+                client_id = str(selected_stop.get("client_id") or "").strip()
+            if not client_id:
+                raise ValueError(
+                    "open_document albaran requires client_id or a selected client/stop in frontend context"
+                )
+            payload["client_id"] = client_id
+        return payload
+
+    raise ValueError(f"Unsupported UI action: {action}")
+
+
 def _execute_tool(
     name: str, args: dict[str, Any], request: Request, frontend_context: dict[str, Any]
 ) -> Any:
@@ -325,6 +534,8 @@ def _execute_tool(
 
     if name == "get_frontend_context":
         return frontend_context
+    if name == "request_ui_action":
+        return _validate_ui_action(args, frontend_context)
     if name == "list_routes":
         df = dl.list_day_cases()
         return [
@@ -540,6 +751,7 @@ def chat(body: ChatRequest, request: Request):
         "tools": config["tools"],
     }
     tool_calls: list[dict[str, Any]] = []
+    ui_actions: list[dict[str, Any]] = []
 
     for _ in range(5):
         response = _gemini_generate(model, payload)
@@ -550,6 +762,7 @@ def chat(body: ChatRequest, request: Request):
             return ChatResponse(
                 reply=reply or "I could not produce a response.",
                 tool_calls=tool_calls,
+                ui_actions=ui_actions,
                 model=model,
             )
 
@@ -562,6 +775,8 @@ def chat(body: ChatRequest, request: Request):
                 result = _json_safe(
                     _execute_tool(name, args, request, body.frontend_context)
                 )
+                if name == "request_ui_action" and isinstance(result, dict):
+                    ui_actions.append(result)
                 tool_calls.append({"name": name, "args": args, "ok": True})
             except Exception as exc:
                 result = {"error": str(exc)}
@@ -583,5 +798,6 @@ def chat(body: ChatRequest, request: Request):
     return ChatResponse(
         reply="I reached the tool-call limit before a final answer. Try narrowing the question.",
         tool_calls=tool_calls,
+        ui_actions=ui_actions,
         model=model,
     )

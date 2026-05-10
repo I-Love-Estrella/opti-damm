@@ -6,7 +6,7 @@ to UMA-based defaults when ZM040 has zeros (which is common in the source).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import pandas as pd
@@ -134,6 +134,13 @@ class SkuRecord:
     dim_y_m: float = 0.0
     dim_h_m: float = 0.0
     dim_source: str = "type"  # "data" | "type"
+    # Per-UMA dimension lookup. The same SKU may ship as CAJ (case),
+    # BOT (bottle), UN (unit), PAL (pallet) etc — each UMA has its own
+    # box dimensions in ZM040. We store ALL plausible UMA→dims here so
+    # callers can pick the right one based on the delivery row's
+    # `Un.medida venta` (UMV), not the SKU's catalog primary UMA.
+    # Each value is (dim_x_m, dim_y_m, dim_h_m, weight_kg).
+    dims_by_uma: dict = field(default_factory=dict)
 
 
 class Catalog:
@@ -207,6 +214,7 @@ def _assemble(raw: RawData) -> dict[str, SkuRecord]:
         nm = str(name_by_sku.get(sku, sku))
         ptype = physical_type(uma, nm)
         dim_x, dim_y, dim_h, dim_src = _pick_dims(zm_full_by_sku.get(sku), uma, ptype)
+        dims_by_uma = _all_dims_by_uma(zm_full_by_sku.get(sku))
         out[sku] = SkuRecord(
             sku=sku,
             name=nm,
@@ -221,7 +229,34 @@ def _assemble(raw: RawData) -> dict[str, SkuRecord]:
             dim_y_m=dim_y,
             dim_h_m=dim_h,
             dim_source=dim_src,
+            dims_by_uma=dims_by_uma,
         )
+    return out
+
+
+def _all_dims_by_uma(zm_rows: pd.DataFrame | None) -> dict[str, tuple[float, float, float, float]]:
+    """Build a {UMA → (dim_x, dim_y, dim_h, weight_kg)} map from ZM040
+    rows. Used so the order builder can pick dims matching the delivery
+    row's `Un.medida venta` (UMV), not the SKU's primary UMA. Skips
+    rows whose dims are zero / out of plausible range."""
+    out: dict[str, tuple[float, float, float, float]] = {}
+    if zm_rows is None or zm_rows.empty:
+        return out
+    for _, row in zm_rows.iterrows():
+        u = str(row.get("UMA") or "").strip().upper()
+        if not u:
+            continue
+        dims_m: list[float] = []
+        for col, unit_col in zip(_DIM_COLS, _DIM_UNIT_COLS):
+            dims_m.append(_to_metres(row.get(col), row.get(unit_col)))
+        x, y, h = dims_m
+        if not all(_DIM_PLAUSIBLE_RANGE_M[0] <= d <= _DIM_PLAUSIBLE_RANGE_M[1] for d in (x, y, h)):
+            continue
+        try:
+            w = float(row.get("Peso bruto") or 0.0)
+        except (TypeError, ValueError):
+            w = 0.0
+        out[u] = (x, y, h, w)
     return out
 
 

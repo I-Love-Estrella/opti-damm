@@ -754,6 +754,65 @@
   border: 1px solid #ff5050;
 }
 
+/* Stability badge — physics-cost of forcing 100% pack */
+.vp-stab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  padding: 4px 10px;
+  border-radius: 2px;
+  border: 1px solid;
+  cursor: help;
+}
+
+.vp-stab-label {
+  font-weight: 700;
+}
+
+.vp-stab-score {
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+
+.vp-stab-detail {
+  display: inline-flex;
+  gap: 6px;
+  font-size: 10px;
+  opacity: 0.75;
+}
+
+.vp-stab-detail em {
+  font-style: normal;
+}
+
+.vp-stab-stable {
+  background: #003c1a;
+  color: #3aff80;
+  border-color: #3aff80;
+}
+
+.vp-stab-wobbly {
+  background: #2a2200;
+  color: #ffd24a;
+  border-color: #c4a032;
+}
+
+.vp-stab-fragile {
+  background: #3a1a00;
+  color: #ffae42;
+  border-color: #c47020;
+}
+
+.vp-stab-dangerous {
+  background: #3c0000;
+  color: #ff8080;
+  border-color: #ff5050;
+}
+
 .vp-counts {
   display: flex;
   gap: 6px;

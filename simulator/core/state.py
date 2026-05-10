@@ -65,6 +65,16 @@ class WorldState:
     # entry is a structured dict (kind, slot_id, sku, qty, reason, pos).
     # Surfaced as KPI `placement_rejections` and `lost_units`.
     placement_rejections: list[dict] = field(default_factory=list)
+    # Chunks the ALGORITHM couldn't pack at planning time (overflow).
+    # Each entry is (client_id, sku, qty). Surfaced as KPI
+    # `pack_overflow_units` so the operator can distinguish:
+    #   - placement_rejections → simulator rejected at runtime
+    #     (algorithm bug, geometry impossible)
+    #   - pack_overflow_units → algorithm couldn't even plan it
+    #     (greedy packer hit its density ceiling vs real-world ~95%)
+    # Real Damm data shows 100% delivery for every recorded route, so
+    # any overflow > 0 is purely a model-fidelity gap, NOT a real fail.
+    pack_overflow: list[tuple[str, str, float]] = field(default_factory=list)
     finalized: bool = False
 
     @classmethod

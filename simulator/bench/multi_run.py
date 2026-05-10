@@ -48,6 +48,8 @@ _AGG_KEYS: tuple[str, ...] = (
     "returnables_picked_units",
     "placement_rejections",
     "lost_units",
+    "pack_overflow_units",
+    "pack_overflow_chunks",
 )
 
 
@@ -390,9 +392,10 @@ def _compact_kpis(kpi: dict) -> dict:
     keep = (
         "total_minutes", "drive_minutes", "service_minutes",
         "total_km", "search_moves", "total_cost_eur",
-        "fill_rate", "pallets_loaded", "drops",
+        "fill_rate", "real_fill_rate", "pallets_loaded", "drops",
         "capacity_violations", "delivered_units", "ordered_units",
         "placement_rejections", "lost_units",
+        "pack_overflow_units", "pack_overflow_chunks",
     )
     return {k: kpi.get(k) for k in keep}
 

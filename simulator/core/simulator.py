@@ -77,6 +77,11 @@ class Simulator:
 
     def run(self, case: DayCase, plan: Plan) -> SimulationResult:
         state = WorldState.from_case(case)
+        # Carry algorithm-time overflow from the Plan into the
+        # WorldState so KPIs surface it as `pack_overflow_units`.
+        # These are chunks the algorithm couldn't pack at planning;
+        # the simulator never sees them as commands.
+        state.pack_overflow = list(plan.pack_overflow)
         log = EventLog()
         log.emit(state.t_min, "SIM_START", algorithm=plan.algorithm, ruta=case.ruta, date=str(case.date))
         cmds = list(plan.commands)

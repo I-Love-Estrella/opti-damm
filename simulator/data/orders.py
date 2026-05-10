@@ -37,6 +37,11 @@ class OrderLine:
     dim_y_m: float = 0.0
     dim_h_m: float = 0.0
     dim_source: str = "type"  # "data" | "type"
+    # Delivery row's UMV (Un.medida venta) — the unit each `qty` is in.
+    # Same SKU may ship as CAJ (case), BOT (bottle), UN (single piece);
+    # dimensions and weight differ per UMV. Empty string means
+    # "use the SKU's catalog primary UMA".
+    umv: str = ""
 
 
 @dataclass(frozen=True)
@@ -213,26 +218,61 @@ class DayCaseBuilder:
 
     def _make_lines(self, sub: pd.DataFrame) -> list[OrderLine]:
         lines: list[OrderLine] = []
-        for sku, grp in sub.groupby("Material"):
+        # Group by (SKU, UMV) — same SKU shipped as different units (CAJ
+        # vs BOT vs UN) needs separate OrderLines because dimensions and
+        # weight differ per UMV. Without this split we'd treat 81 cases
+        # as 81 individual unit-sized boxes (5× too many anchors), and
+        # the packer overflows on tight days that physically fit in
+        # reality.
+        for (sku, umv_raw), grp in sub.groupby(["Material", "Un.medida venta"]):
             if not isinstance(sku, str) or not sku:
                 continue
-            rec = self._catalog.get(sku)
             qty = float(grp["Cantidad entrega"].sum())
             if qty <= 0:
                 continue
+            rec = self._catalog.get(sku)
+            umv = str(umv_raw or "").strip().upper()
+
+            # UMV-specific dims. If ZM040 has a row for (sku, umv) use
+            # that; else fall back to the catalog's primary-UMA dims;
+            # else physical_type defaults further down the chain.
+            uma_dims = rec.dims_by_uma.get(umv) if umv else None
+            if uma_dims:
+                dim_x, dim_y, dim_h, weight = uma_dims
+                dim_src = "data"
+                # If the UMV-specific weight is missing/zero, fall
+                # back to the catalog's per-unit weight (it might be
+                # for a different UMA, but better than zero).
+                if weight <= 0:
+                    weight = rec.unit_weight_kg
+            else:
+                dim_x = rec.dim_x_m
+                dim_y = rec.dim_y_m
+                dim_h = rec.dim_h_m
+                dim_src = rec.dim_source
+                weight = rec.unit_weight_kg
+
+            # Physical type follows the row's UMV: a 'CAJ' line is a
+            # CASE (regardless of what catalog's primary UMA says),
+            # a 'BOT' line is a BOTTLE, etc. This determines
+            # handling time, returnable rules, and pallet class.
+            from simulator.data.catalog import physical_type as classify_ptype
+            ptype = classify_ptype(umv or rec.uma, rec.name)
+
             lines.append(
                 OrderLine(
                     sku=sku,
                     qty=qty,
                     uma=rec.uma,
                     unit_volume_m3=rec.unit_volume_m3,
-                    unit_weight_kg=rec.unit_weight_kg,
+                    unit_weight_kg=weight,
                     is_returnable=rec.is_returnable,
-                    physical_type=rec.physical_type,
-                    dim_x_m=rec.dim_x_m,
-                    dim_y_m=rec.dim_y_m,
-                    dim_h_m=rec.dim_h_m,
-                    dim_source=rec.dim_source,
+                    physical_type=ptype,
+                    dim_x_m=dim_x,
+                    dim_y_m=dim_y,
+                    dim_h_m=dim_h,
+                    dim_source=dim_src,
+                    umv=umv,
                 )
             )
         return lines
@@ -258,7 +298,10 @@ class DayCaseBuilder:
         rating are the binding constraint exactly at the listed kg.
         """
 
-        PACK_DENSITY_FUDGE = 0.70
+        # 0.55 — observed real packing density on this dataset.
+        # Was 0.70; tight days (DR0017 6.79 m³ AABB) still fit T6 by
+        # raw cube but in practice only 35-50 % packs cleanly.
+        PACK_DENSITY_FUDGE = 0.55
 
         def _aabb_volume(line) -> float:
             # Prefer the catalog's measured dim_x_m / dim_y_m / dim_h_m.

@@ -221,6 +221,8 @@ def _run_one(
                     "dim_x": float(it.dim_x),
                     "dim_y": float(it.dim_y),
                     "dim_h": float(it.dim_h),
+                    "unit_weight_kg": float(it.unit_weight_kg),
+                    "unit_volume_m3": float(it.unit_volume_m3),
                 }
             )
         initial_cargo.append(

@@ -17,7 +17,7 @@ from simulator.config import (
     TRUCK_SPECS,
     TruckSpec,
 )
-from simulator.data.catalog import Catalog, PhysicalType
+from simulator.data.catalog import Catalog, PhysicalType, physical_dims
 from simulator.data.clients import Clients
 from simulator.data.loader import RawData
 
@@ -238,10 +238,56 @@ class DayCaseBuilder:
         return lines
 
     def _pick_truck(self, orders: list[ClientOrder]) -> TruckSpec:
-        total_vol = sum(o.total_volume_m3 for o in orders)
+        """Pick the smallest truck that comfortably fits the day.
+
+        We use AABB physical dimensions (dim_x × dim_y × dim_h) — NOT
+        the catalog `unit_volume_m3` — because that catalog value is
+        often the pure liquid volume (e.g. a 1.5 L bottle = 0.0015 m³)
+        while the actual carton or bottle on the pallet occupies an
+        AABB cube ~10× that. Picking by liquid volume let DR0017 land
+        on T6 with a "1.21 m³" cargo claim, then 31 chunks overflowed
+        because the real footprint was ~4 m³.
+
+        Real-world 3D bin-packing rarely exceeds ~70 % of the raw
+        cube — extreme-points anchors leave gaps, narrow towers can't
+        reach pallet height, KEG and BOX stay on separate pallets.
+        So we apply a `PACK_DENSITY_FUDGE = 0.70` headroom on the
+        AABB volume.
+
+        Weight has no fudge factor — pallet jacks and the truck axle
+        rating are the binding constraint exactly at the listed kg.
+        """
+
+        PACK_DENSITY_FUDGE = 0.70
+
+        def _aabb_volume(line) -> float:
+            # Prefer the catalog's measured dim_x_m / dim_y_m / dim_h_m.
+            # If unavailable, fall back to physical_dims by type.
+            if (
+                getattr(line, "dim_source", "type") == "data"
+                and line.dim_x_m > 0
+                and line.dim_y_m > 0
+                and line.dim_h_m > 0
+            ):
+                return line.qty * line.dim_x_m * line.dim_y_m * line.dim_h_m
+            ptype = (
+                line.physical_type.value
+                if hasattr(line.physical_type, "value")
+                else str(line.physical_type)
+            )
+            dx, dy, dh = physical_dims(ptype)
+            return line.qty * dx * dy * dh
+
+        total_vol_aabb = sum(
+            _aabb_volume(line) for o in orders for line in o.lines
+        )
         total_wt = sum(o.total_weight_kg for o in orders)
         for code in (DEFAULT_TRUCK, "T8", "V3"):
             spec = TRUCK_SPECS[code]
-            if total_vol <= spec.pallet_capacity * PALLET_VOLUME_M3 and total_wt <= spec.max_weight_kg:
+            cap_vol_effective = (
+                spec.pallet_capacity * PALLET_VOLUME_M3 * PACK_DENSITY_FUDGE
+            )
+            if total_vol_aabb <= cap_vol_effective and total_wt <= spec.max_weight_kg:
                 return spec
+        # Largest available — accept that fill-rate may still be low.
         return TRUCK_SPECS["T8"]

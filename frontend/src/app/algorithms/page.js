@@ -8,11 +8,188 @@ import StopTimeline from '@/components/StopTimeline';
 import StepPlayer from '@/components/StepPlayer';
 import ActionLog from '@/components/ActionLog';
 import ValidationPanel from '@/components/ValidationPanel';
-import { cargoStateAt, flattenStages, buildLiftReplaceMap } from '@/lib/cargoState';
+import {
+  cargoStateAt,
+  flattenStages,
+  buildLiftReplaceMap,
+  computeCenterOfMass,
+  COM_LATERAL_WARN_M,
+  COM_LATERAL_ERROR_M,
+  COM_LONGITUDINAL_WARN_M,
+  COM_HIGH_WARN_M,
+} from '@/lib/cargoState';
 import './algorithms.css';
 
 const RouteMap = dynamic(() => import('@/components/RouteMap'), { ssr: false });
 const Truck3D = dynamic(() => import('@/components/Truck3D'), { ssr: false });
+
+function comTone(value, warn, err) {
+  const a = Math.abs(value);
+  if (a > err) return { color: '#ff5050', label: 'ROLLOVER RISK' };
+  if (a > warn) return { color: '#fc0', label: 'WATCH TURNS' };
+  return { color: '#3aff80', label: 'OK' };
+}
+
+function CenterOfMassPanel({ com }) {
+  const lateral = comTone(com.lateral_z, COM_LATERAL_WARN_M, COM_LATERAL_ERROR_M);
+  // longitudinal is warning-only (axle imbalance)
+  const longi = comTone(
+    com.longitudinal_x,
+    COM_LONGITUDINAL_WARN_M,
+    COM_LONGITUDINAL_WARN_M * 1.6,
+  );
+  // vertical is height above floor — high = top-heavy
+  const vert =
+    com.vertical_y > COM_HIGH_WARN_M
+      ? { color: '#fc0', label: 'TOP-HEAVY' }
+      : { color: '#3aff80', label: 'OK' };
+  // Visual bar: lateral_z, range ±0.50m, with warn/error tick marks.
+  const RANGE_M = 0.50;
+  const barWidthPct = Math.min(100, (Math.abs(com.lateral_z) / RANGE_M) * 100);
+  const barLeftPct = com.lateral_z < 0 ? 50 - barWidthPct / 2 : 50;
+  // Actually compute precise position: mid of bar = 0, edge = ±RANGE_M
+  const lateralMidPct = 50 + (com.lateral_z / RANGE_M) * 50;
+
+  return (
+    <div
+      style={{
+        width: 240,
+        flexShrink: 0,
+        background: '#0c0c0c',
+        border: '1px solid #1f1f1f',
+        padding: '12px 14px',
+        fontFamily: 'var(--mono)',
+        fontSize: 11,
+        color: '#cfcfcf',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 12,
+      }}
+    >
+      <div style={{ color: '#888', letterSpacing: '0.08em' }}>
+        CENTER OF MASS
+      </div>
+
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+          <span>Lateral (L↔R)</span>
+          <span style={{ color: lateral.color, fontWeight: 600 }}>
+            {com.lateral_z >= 0 ? '+' : ''}
+            {com.lateral_z.toFixed(2)} m
+          </span>
+        </div>
+        <div
+          style={{
+            position: 'relative',
+            height: 8,
+            background: '#1a1a1a',
+            border: '1px solid #2a2a2a',
+            borderRadius: 1,
+          }}
+        >
+          {/* Warn band ±0.20m */}
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              bottom: 0,
+              left: `${50 - (COM_LATERAL_WARN_M / RANGE_M) * 50}%`,
+              width: `${(2 * COM_LATERAL_WARN_M / RANGE_M) * 50}%`,
+              background: 'rgba(58, 255, 128, 0.10)',
+            }}
+          />
+          {/* Error band ±0.30m..0.50m (warn band) */}
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              bottom: 0,
+              left: `${50 - (COM_LATERAL_ERROR_M / RANGE_M) * 50}%`,
+              width: `${((COM_LATERAL_ERROR_M - COM_LATERAL_WARN_M) / RANGE_M) * 50}%`,
+              background: 'rgba(255, 204, 0, 0.15)',
+            }}
+          />
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              bottom: 0,
+              right: `${50 - (COM_LATERAL_ERROR_M / RANGE_M) * 50}%`,
+              width: `${((COM_LATERAL_ERROR_M - COM_LATERAL_WARN_M) / RANGE_M) * 50}%`,
+              background: 'rgba(255, 204, 0, 0.15)',
+            }}
+          />
+          {/* Centerline */}
+          <div
+            style={{
+              position: 'absolute',
+              left: '50%',
+              top: -2,
+              bottom: -2,
+              width: 1,
+              background: '#444',
+            }}
+          />
+          {/* Pointer */}
+          <div
+            style={{
+              position: 'absolute',
+              left: `${Math.max(0, Math.min(100, lateralMidPct))}%`,
+              top: -3,
+              bottom: -3,
+              width: 3,
+              background: lateral.color,
+              transform: 'translateX(-50%)',
+              boxShadow: `0 0 4px ${lateral.color}`,
+            }}
+          />
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            color: '#666',
+            fontSize: 9,
+            marginTop: 2,
+          }}
+        >
+          <span>L 0.50m</span>
+          <span style={{ color: lateral.color }}>{lateral.label}</span>
+          <span>R 0.50m</span>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <span>Longitudinal (F↔B)</span>
+        <span style={{ color: longi.color, fontWeight: 600 }}>
+          {com.longitudinal_x >= 0 ? '+' : ''}
+          {com.longitudinal_x.toFixed(2)} m
+        </span>
+      </div>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <span>Vertical (height)</span>
+        <span style={{ color: vert.color, fontWeight: 600 }}>
+          {com.vertical_y.toFixed(2)} m
+        </span>
+      </div>
+
+      <div
+        style={{
+          marginTop: 'auto',
+          paddingTop: 8,
+          borderTop: '1px solid #1f1f1f',
+          color: '#888',
+          fontSize: 10,
+          lineHeight: 1.4,
+        }}
+      >
+        <div>Total mass: <b style={{ color: '#cfcfcf' }}>{com.total_kg.toFixed(0)} kg</b></div>
+        <div style={{ marginTop: 4 }}>Lateral cap: warn 0.20 m / err 0.30 m</div>
+      </div>
+    </div>
+  );
+}
 
 function Playback3D({ run }) {
   const stops = run?.data?.stops || [];
@@ -55,6 +232,9 @@ function Playback3D({ run }) {
     [initialCargo, flatStages, idx],
   );
 
+  // Recompute COG every step.
+  const com = useMemo(() => computeCenterOfMass(state.boxes), [state.boxes]);
+
   if (!truck || flatStages.length === 0) return null;
 
   const atViolation = violationStops.some((v) => idx >= v.stage_idx);
@@ -96,13 +276,18 @@ function Playback3D({ run }) {
           </ul>
         </div>
       )}
-      <Truck3D
-        truck={truck}
-        palletsBySlot={state.palletsBySlot}
-        boxes={state.boxes}
-        highlightSeq={idx > 0 ? idx - 1 : undefined}
-        height={480}
-      />
+      <div style={{ display: 'flex', gap: 12, alignItems: 'stretch' }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <Truck3D
+            truck={truck}
+            palletsBySlot={state.palletsBySlot}
+            boxes={state.boxes}
+            highlightSeq={idx > 0 ? idx - 1 : undefined}
+            height={480}
+          />
+        </div>
+        <CenterOfMassPanel com={com} />
+      </div>
       <StepPlayer
         stages={flatStages}
         idx={idx}
@@ -357,7 +542,8 @@ function fmt(n, digits = 2) {
 }
 
 function BatchPanel({
-  algo, days,
+  algo, days, trucks,
+  truckCode, onTruckChange,
   mode, onModeChange,
   n, onNChange,
   seed, onSeedChange,
@@ -379,6 +565,17 @@ function BatchPanel({
       </header>
 
       <div className="batch-controls">
+        <div className="control-group control-group-wide">
+          <label title="Force a specific truck for every case in this run. Default: each case gets the smallest truck that fits its cargo.">
+            Truck
+          </label>
+          <TruckPicker
+            trucks={trucks}
+            value={truckCode}
+            onChange={onTruckChange}
+            idPrefix="batch-"
+          />
+        </div>
         <div className="control-group">
           <label>Mode</label>
           <select value={mode} onChange={(e) => onModeChange(e.target.value)}>
@@ -565,6 +762,41 @@ function SummaryCard({ label, value, good, bad }) {
   );
 }
 
+// Segmented pill selector for the truck choice. Four options:
+// `auto` (let the builder pick the smallest fit per case) and the three
+// fleet types — T6 (6-pallet, the everyday workhorse), T8 (8-pallet,
+// for heavy days), V3 (3-pallet van, B-side only, for tight urban runs).
+function TruckPicker({ trucks, value, onChange, idPrefix = '' }) {
+  const opts = [
+    { code: '', label: 'auto', sub: 'smallest fit / case' },
+    ...(trucks || []).map((t) => ({
+      code: t.code,
+      label: t.code,
+      sub: `${t.pallet_capacity} plt · ${t.max_weight_kg} kg`,
+    })),
+  ];
+  return (
+    <div className="truck-picker" role="radiogroup" aria-label="Truck">
+      {opts.map((o) => {
+        const active = (value || '') === o.code;
+        return (
+          <button
+            key={o.code || 'auto'}
+            id={`${idPrefix}truck-${o.code || 'auto'}`}
+            role="radio"
+            aria-checked={active}
+            className={`tp-btn${active ? ' active' : ''}`}
+            onClick={() => onChange(o.code || null)}
+          >
+            <span className="tp-label">{o.label}</span>
+            <span className="tp-sub">{o.sub}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // === Compare panel ====================================================
 //
 // Head-to-head comparison: run TWO algorithms on the SAME N cases, then
@@ -596,9 +828,10 @@ function deltaCellClass(deltaPct, lowerBetter) {
 }
 
 function ComparePanel({
-  algorithms, days,
+  algorithms, days, trucks,
   algoA, onAlgoAChange,
   algoB, onAlgoBChange,
+  truckCode, onTruckChange,
   mode, onModeChange,
   n, onNChange,
   seed, onSeedChange,
@@ -639,6 +872,17 @@ function ComparePanel({
               <option key={a.name} value={a.name}>{a.name}</option>
             ))}
           </select>
+        </div>
+        <div className="control-group control-group-wide">
+          <label title="Force a specific truck for every case in this comparison. Default: each case gets the smallest truck that fits its cargo.">
+            Truck
+          </label>
+          <TruckPicker
+            trucks={trucks}
+            value={truckCode}
+            onChange={onTruckChange}
+            idPrefix="cmp-"
+          />
         </div>
         <div className="control-group">
           <label>Mode</label>
@@ -825,6 +1069,8 @@ function ComparePanel({
               <thead>
                 <tr>
                   <th>Date</th><th>Ruta</th>
+                  <th title="Truck used by A on this case">A trk</th>
+                  <th title="Truck used by B on this case">B trk</th>
                   <th>A cost</th><th>B cost</th><th>Δ %</th>
                   <th>A km</th><th>B km</th>
                   <th>A search</th><th>B search</th>
@@ -839,10 +1085,15 @@ function ComparePanel({
                   const aCost = ak.total_cost_eur ?? 0;
                   const bCost = bk.total_cost_eur ?? 0;
                   const dPct = aCost > 0 ? ((bCost - aCost) / aCost) * 100 : 0;
+                  const aTrk = c.a?.truck || '—';
+                  const bTrk = c.b?.truck || '—';
+                  const trucksDiffer = aTrk !== bTrk;
                   return (
                     <tr key={`${c.date}-${c.ruta}`}>
                       <td>{c.date}</td>
                       <td><code>{c.ruta}</code></td>
+                      <td className={trucksDiffer ? 'cmp-truck-diff' : ''}>{aTrk}</td>
+                      <td className={trucksDiffer ? 'cmp-truck-diff' : ''}>{bTrk}</td>
                       <td>{fmt(aCost, 0)}</td>
                       <td>{fmt(bCost, 0)}</td>
                       <td className={deltaCellClass(dPct, true)}>
@@ -1255,6 +1506,9 @@ export default function AlgorithmsPage() {
         <BatchPanel
           algo={selectedAlgo}
           days={days}
+          trucks={trucks}
+          truckCode={selectedTruck}
+          onTruckChange={setSelectedTruck}
           mode={batchMode}
           onModeChange={setBatchMode}
           n={batchN}
@@ -1273,10 +1527,13 @@ export default function AlgorithmsPage() {
         <ComparePanel
           algorithms={algorithms}
           days={days}
+          trucks={trucks}
           algoA={compareAlgoA}
           onAlgoAChange={setCompareAlgoA}
           algoB={compareAlgoB}
           onAlgoBChange={setCompareAlgoB}
+          truckCode={selectedTruck}
+          onTruckChange={setSelectedTruck}
           mode={compareMode}
           onModeChange={setCompareMode}
           n={compareN}

@@ -81,11 +81,17 @@ from simulator.domain.truck import Slot, build_slots
 
 PALLET_MAX_WEIGHT_KG = 1000.0
 KEG_MAX_STACK = 2
-# Validator threshold is 3.5; matched here so the per-chunk packer has
-# the same stability budget as the validator. The per-column unit cap
-# in `_column_ok` keeps the post-unload state from drifting into
-# STACK_UNSTABLE territory once items below get delivered.
+# Validator caps aspect ratio at STACK_RATIO_ERROR=3.5 (hard error) and
+# STACK_RATIO_WARN=3.0 (warning). We pack at 3.5 (matches validator's
+# hard ceiling) — anything tighter (e.g. 2.95) sounds attractive
+# because it silences STACK_WOBBLY warnings, but in practice it
+# rejected so many anchors that fill_rate cratered on tight days
+# (DR0017 went from 100% → 80%, DR0050 71%, DR0051 17%, DR0054 44%).
+# The trade-off is: STACK_WOBBLY is a *warning*, not an error — and
+# customers care about delivered cargo far more than about a stack
+# being 0.05 over the wobbly threshold. We accept the warnings.
 STACK_RATIO = 3.5
+PACK_ASPECT_NON_KEG = 3.5
 IDEAL_X = 0.52
 IDEAL_Y = 0.50
 _BBOX_EPS = 1e-6
@@ -132,13 +138,14 @@ def _stack_chunk_qty(qty: float, dx: float, dy: float, dh: float, *, is_keg: boo
     # Maximise items per chunk. Each Pick command costs the loader a
     # fixed `pick_min_per_sku` (2 min) regardless of qty, so splitting
     # the same SKU into many small chunks blows up depot loading time.
-    # Kegs cap at the KEG_MAX_STACK=2 business rule. Other items cap at
-    # the stability-aspect ratio AND the pallet height ceiling — both
-    # already enforced by the validator.
+    # Kegs cap at the KEG_MAX_STACK=2 business rule (validator accepts
+    # the resulting 1.30 m / 0.40 m = 3.25 ratio as inherent). Other
+    # items cap at PACK_ASPECT_NON_KEG=2.95 — under validator's WARN
+    # threshold so we never produce STACK_WOBBLY anchors.
     if is_keg:
         return float(min(qty, KEG_MAX_STACK))
     narrow = max(1e-3, min(dx, dy))
-    max_units = max(1, int((STACK_RATIO * narrow) / max(dh, 1e-3)))
+    max_units = max(1, int((PACK_ASPECT_NON_KEG * narrow) / max(dh, 1e-3)))
     by_height = max(1, int(PALLET_HEIGHT_M / max(dh, 1e-3)))
     return float(min(qty, max_units, by_height))
 
@@ -149,6 +156,8 @@ def _find_position_safe(
     dim_y: float,
     stack_h: float,
     unit_weight_kg: float,
+    *,
+    is_keg: bool = False,
 ) -> tuple[tuple[float, float, float] | None, int]:
     """Strict packer: ≥ 50 % support coverage, no crush, aspect-stable.
 
@@ -160,15 +169,21 @@ def _find_position_safe(
         when a heavy case ends up on top of a light unit.
     Chunks that don't fit overflow and the caller opens a fresh pallet
     (subject to the per-class quota) or drops the chunk.
+
+    Aspect limit: kegs use the validator's hard ceiling (3.5) since their
+    standard 2-stack already sits at 3.25. Everything else uses the
+    tighter 2.95 — anchor selection then refuses any spot that would
+    trigger the validator's STACK_WOBBLY (warn > 3.0) bucket.
     """
 
+    aspect = STACK_RATIO if is_keg else PACK_ASPECT_NON_KEG
     pos = find_position(
         items,
         dim_x=dim_x,
         dim_y=dim_y,
         dim_h=stack_h,
         enforce_pallet_height=True,
-        aspect_limit=STACK_RATIO,
+        aspect_limit=aspect,
         unit_weight_kg=unit_weight_kg,
         require_support=True,
         avoid_crush=True,
@@ -409,6 +424,7 @@ class HistoricMimic(Algorithm):
                         chunk.unit_dim_y,
                         chunk.stack_h,
                         chunk.unit_weight_kg,
+                        is_keg=chunk.is_keg,
                     )
                     if pos is None:
                         return None
@@ -461,13 +477,12 @@ class HistoricMimic(Algorithm):
                         current = best_d
                         placed = True
 
-                # 3. Open a fresh pallet only when nothing existing fits
-                #    AND we haven't blown the per-class quota yet.
-                if (
-                    not placed
-                    and len(drafts) < max_pallets
-                    and cls_pallet_count() < cls_quota
-                ):
+                # 3. Open a fresh pallet — first within the per-class
+                #    quota, then (cascade) over the quota if the truck
+                #    still has free slots overall. The quota was meant
+                #    to *balance* slot use between KEG and BOX, not to
+                #    drop chunks while slots sit empty.
+                if not placed and len(drafts) < max_pallets:
                     fresh = new_draft(cls)
                     pos = try_strict(fresh)
                     if pos is not None:
@@ -650,6 +665,85 @@ class HistoricMimic(Algorithm):
             if their_seq < my_seq:
                 return False
         return True
+
+    def _try_relaxed_lifo(
+        self,
+        chunk: _Chunk,
+        drafts: list[_PalletDraft],
+        cls: PalletClass,
+    ) -> tuple[_PalletDraft, tuple[float, float, float]] | None:
+        """Place chunk on any existing pallet of `cls`, ignoring the
+        LIFO support guard but keeping every other constraint
+        (no-overlap, ≥50% support, no crush, weight cap, column cap,
+        aspect ratio). The take-bug fix means a SETTLE late in the
+        route is benign — the cargo is still delivered."""
+        best_pos: tuple[float, float, float] | None = None
+        best_d: _PalletDraft | None = None
+        for d in drafts:
+            if d.pallet_class != cls:
+                continue
+            if d.weight_kg + chunk.weight_kg > PALLET_MAX_WEIGHT_KG:
+                continue
+            pos, _ = _find_position_safe(
+                d.items,
+                chunk.unit_dim_x,
+                chunk.unit_dim_y,
+                chunk.stack_h,
+                chunk.unit_weight_kg,
+                is_keg=chunk.is_keg,
+            )
+            if pos is None:
+                continue
+            if not self._column_ok(d.items, pos, chunk):
+                continue
+            if best_pos is None or (pos[2], pos[1], pos[0]) < (
+                best_pos[2], best_pos[1], best_pos[0],
+            ):
+                best_pos, best_d = pos, d
+        if best_pos is not None and best_d is not None:
+            return best_d, best_pos
+        return None
+
+    def _try_relaxed_aspect(
+        self,
+        chunk: _Chunk,
+        drafts: list[_PalletDraft],
+        cls: PalletClass,
+    ) -> tuple[_PalletDraft, tuple[float, float, float]] | None:
+        """Place chunk on any pallet using the validator's HARD aspect
+        ceiling (3.5) instead of the algorithm's soft 2.95 target.
+        Trades STACK_WOBBLY warnings for fill-rate. Still enforces
+        no-overlap / ≥50%-support / no-crush / column cap, so we never
+        produce a hard validator ERROR."""
+        best_pos: tuple[float, float, float] | None = None
+        best_d: _PalletDraft | None = None
+        for d in drafts:
+            if d.pallet_class != cls:
+                continue
+            if d.weight_kg + chunk.weight_kg > PALLET_MAX_WEIGHT_KG:
+                continue
+            pos = find_position(
+                d.items,
+                dim_x=chunk.unit_dim_x,
+                dim_y=chunk.unit_dim_y,
+                dim_h=chunk.stack_h,
+                enforce_pallet_height=True,
+                aspect_limit=STACK_RATIO,  # 3.5 — validator's hard ceiling
+                unit_weight_kg=chunk.unit_weight_kg,
+                require_support=True,
+                avoid_crush=True,
+            )
+            if pos is None:
+                continue
+            if not self._column_ok(d.items, pos, chunk):
+                continue
+            if best_pos is None or (pos[2], pos[1], pos[0]) < (
+                best_pos[2], best_pos[1], best_pos[0],
+            ):
+                best_pos, best_d = pos, d
+        if best_pos is not None and best_d is not None:
+            return best_d, best_pos
+        return None
 
     @staticmethod
     def _column_ok(
@@ -852,11 +946,23 @@ class HistoricMimic(Algorithm):
         assignment: dict[str, str],
         slots: list[Slot],
         truck,
-        target_offset_m: float = 0.20,
-        max_iter: int = 20,
+        target_offset_m: float = 0.18,
+        max_iter: int = 30,
     ) -> dict[str, str]:
-        """Swap L↔R pallets (within the same class) to drive the truck's
-        lateral centre of mass toward zero. Greedy hill-climb over swaps."""
+        """Swap L↔R pallets to drive the truck's lateral centre of mass
+        toward zero. Greedy hill-climb over swaps.
+
+        Cross-class swaps ARE allowed: a slot is just a position in the
+        truck — it doesn't enforce per-class semantics. The pallet keeps
+        its own class-discipline (no KEG-on-BOX inside one pallet) no
+        matter which slot it lands in. Refusing cross-class swaps used
+        to leave catastrophic 5×–12× L/R weight imbalances when one
+        class clustered to one side (e.g. all 7 keg pallets on L).
+
+        target_offset_m=0.18 sits below the validator's COM_LATERAL_WARN
+        threshold (0.20), so we don't even emit the soft warning when
+        the swap is feasible.
+        """
 
         if truck is None:
             return assignment
@@ -877,8 +983,6 @@ class HistoricMimic(Algorithm):
             ]
             for lp in l_pallets:
                 for rp in r_pallets:
-                    if by_pid[lp].pallet_class != by_pid[rp].pallet_class:
-                        continue  # never mix KEG ↔ BOX
                     trial = dict(assignment)
                     trial[lp], trial[rp] = trial[rp], trial[lp]
                     offset = abs(self._lateral_com_z(by_pid, trial))

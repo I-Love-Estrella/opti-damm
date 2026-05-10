@@ -73,6 +73,11 @@ class CaseResult:
     # / INFO row produced by validate_plan, kept lightweight for transport.
     # Each item: {severity, code, message, where}.
     issues: list[dict] = field(default_factory=list)
+    # The truck spec actually used (matters when truck_code=None and the
+    # builder auto-picks: a tight day may end up on T8 while a sibling
+    # day on the same sweep gets T6).
+    truck_code: str = ""
+    truck_capacity: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -87,6 +92,8 @@ class CaseResult:
             "kpis": self.kpis,
             "elapsed_sec": round(self.elapsed_sec, 4),
             "issues": list(self.issues),
+            "truck_code": self.truck_code,
+            "truck_capacity": self.truck_capacity,
         }
 
 
@@ -339,6 +346,8 @@ def run_multi(
             validation_errors=v_errors,
             validation_warnings=v_warnings,
             physics_violations=physics,
+            truck_code=case.truck.code,
+            truck_capacity=case.truck.pallet_capacity,
             kpis=_compact_kpis(kpi_dict),
             elapsed_sec=elapsed,
             issues=issues_compact,

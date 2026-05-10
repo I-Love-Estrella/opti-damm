@@ -74,6 +74,8 @@ class CompareCase:
     b_val_errors: int
     a_elapsed_sec: float
     b_elapsed_sec: float
+    a_truck: str = ""
+    b_truck: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +87,7 @@ class CompareCase:
                 "physics_violations": self.a_physics,
                 "validation_errors": self.a_val_errors,
                 "elapsed_sec": round(self.a_elapsed_sec, 4),
+                "truck": self.a_truck,
             },
             "b": {
                 "kpis": self.b_kpis,
@@ -92,6 +95,7 @@ class CompareCase:
                 "physics_violations": self.b_physics,
                 "validation_errors": self.b_val_errors,
                 "elapsed_sec": round(self.b_elapsed_sec, 4),
+                "truck": self.b_truck,
             },
         }
 
@@ -189,6 +193,8 @@ def _build_pairs(
                 b_val_errors=int(b.validation_errors if b else 0),
                 a_elapsed_sec=float(a.elapsed_sec if a else 0.0),
                 b_elapsed_sec=float(b.elapsed_sec if b else 0.0),
+                a_truck=str(a.truck_code if a else ""),
+                b_truck=str(b.truck_code if b else ""),
             )
         )
     return out

@@ -651,6 +651,8 @@ class Simulator:
             dim_x=cmd.dim_x,
             dim_y=cmd.dim_y,
             dim_h=cmd.dim_h,
+            physical_type=cmd.physical_type,
+            unit_weight_kg=cmd.unit_weight_kg,
         )
 
     def _on_return_depot(self, st: WorldState, log: EventLog) -> None:

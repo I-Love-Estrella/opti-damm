@@ -2544,3 +2544,58 @@
   word-break: break-word;
   line-height: 1.4;
 }
+
+.batch-table td.cmp-truck-diff { color: #fc0; font-weight: 700; }
+
+/* === Truck picker (4-option pill segmented control) ================= */
+
+.control-group-wide { flex: 1 1 auto; min-width: 280px; }
+
+.truck-picker {
+  display: flex;
+  gap: 4px;
+  border: 1px solid #2a2a2a;
+  background: #0a0a0a;
+  border-radius: 4px;
+  padding: 3px;
+}
+
+.tp-btn {
+  flex: 1 1 auto;
+  background: transparent;
+  border: 1px solid transparent;
+  color: #888;
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 2px;
+  font-family: var(--mono);
+  text-align: left;
+  transition: background 80ms ease, color 80ms ease, border-color 80ms ease;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 70px;
+}
+
+.tp-btn:hover { background: #131313; color: #ccc; }
+
+.tp-btn.active {
+  background: #001f0e;
+  border-color: #1f5a32;
+  color: #5fffa0;
+}
+
+.tp-label {
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tp-sub {
+  font-size: 10px;
+  color: #777;
+  letter-spacing: 0.02em;
+}
+
+.tp-btn.active .tp-sub { color: #4ad080; }

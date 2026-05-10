@@ -167,6 +167,7 @@ export function buildInitialBoxes(initialCargo = []) {
           dim_h: slice_h || (it.dim_h ?? 0.24),
           sku: it.sku,
           qty: stackSize > 0 ? it.qty / stackSize : it.qty,
+          unit_weight_kg: it.unit_weight_kg ?? 0,
           intended_client: it.intended_client,
           is_returnable_empty: it.is_returnable_empty,
           physical_type: it.physical_type || 'unit',
@@ -396,9 +397,13 @@ export function cargoStateAt(initialCargo, stages, idx) {
             dim_h: sliceH,
             sku: d.sku || 'EMPTY',
             qty: 1,
+            // Empty kegs ≈ 2 kg, empty crates ≈ 0.6 kg, bottles ≈ 0.3 kg.
+            // Picked up from the event when present, otherwise default
+            // to keg weight.
+            unit_weight_kg: d.unit_weight_kg ?? 2.0,
             intended_client: null,
             is_returnable_empty: true,
-            physical_type: 'keg',
+            physical_type: d.physical_type || 'keg',
             stack_member_idx: k,
             stack_member_total: qty,
             source_sku: d.sku || 'EMPTY',
@@ -417,5 +422,116 @@ export function cargoStateAt(initialCargo, stages, idx) {
     pendingStage: upTo < stages.length ? stages[upTo] : null,
     idx: upTo,
     total: stages.length,
+  };
+}
+
+
+// ---- Centre-of-mass computation ------------------------------------------
+//
+// Mirrors the validator's lateral / longitudinal / vertical COM math (see
+// simulator/validation/validator.py::_center_of_mass) so the live readout
+// in the playback agrees with the post-hoc PLAN REJECTED warnings.
+//
+// Truck coordinate convention:
+//   X — front/back (along the truck length). Positive = back.
+//   Z — left/right (lateral). Positive = right side. Rollover risk axis.
+//   Y — height above the truck floor.
+//
+// Thresholds (matching validator constants):
+//   COM_LATERAL_WARN_M   = 0.20   → "watch sharp turns"
+//   COM_LATERAL_ERROR_M  = 0.30   → rollover risk
+
+const _PALLET_LEN_M = 1.20;
+const _PALLET_WIDTH_M = 0.80;
+const _SLOT_GAP_X_M = 0.06;
+const _LR_GAP_M = 0.10;
+
+export const COM_LATERAL_WARN_M = 0.20;
+export const COM_LATERAL_ERROR_M = 0.30;
+export const COM_LONGITUDINAL_WARN_M = 0.50;
+export const COM_HIGH_WARN_M = 1.20;
+
+function _slotWorldXZ(slotId, maxSidePos) {
+  const m = /^([LRB])(\d+)$/.exec(slotId);
+  if (!m) return null;
+  const side = m[1];
+  const pos = parseInt(m[2], 10);
+  const totalLength = maxSidePos * (_PALLET_LEN_M + _SLOT_GAP_X_M);
+  const startX = -totalLength / 2 + (_PALLET_LEN_M + _SLOT_GAP_X_M) / 2;
+  const x = startX + (pos - 1) * (_PALLET_LEN_M + _SLOT_GAP_X_M);
+  if (side === 'L') return { x, z: -(_PALLET_WIDTH_M / 2 + _LR_GAP_M / 2) };
+  if (side === 'R') return { x, z: +(_PALLET_WIDTH_M / 2 + _LR_GAP_M / 2) };
+  // Back row — sticks out behind the body, on the centerline.
+  const backX = totalLength / 2 + _PALLET_LEN_M / 2 + 0.10;
+  return { x: backX, z: 0 };
+}
+
+function _maxSidePos(boxes) {
+  let max = 1;
+  for (const b of boxes) {
+    const m = /^([LRB])(\d+)$/.exec(b.slot_id || '');
+    if (!m || m[1] === 'B') continue;
+    const p = parseInt(m[2], 10);
+    if (p > max) max = p;
+  }
+  return max;
+}
+
+/**
+ * Compute the truck's centre of mass from the live box list.
+ * Returns metres in truck-local frame:
+ *   - lateral_z:    +right / -left  (rollover axis)
+ *   - longitudinal_x: +back / -front (axle balance)
+ *   - vertical_y:   above the floor (top-heavy axis)
+ *
+ * Each box's own pos_y/pos_z within its pallet shifts it from the slot
+ * centre. Boxes in the driver's hands (status !== 'in_pallet') are
+ * skipped — they're transient and don't load the truck axles.
+ */
+export function computeCenterOfMass(boxes = []) {
+  const maxPos = _maxSidePos(boxes);
+  let totalMass = 0;
+  let mx = 0;
+  let mz = 0;
+  let my = 0;
+  for (const b of boxes) {
+    if (b.status !== 'in_pallet') continue;
+    const mass = (b.qty ?? 0) * (b.unit_weight_kg ?? 0);
+    if (mass <= 0) continue;
+    const slot = _slotWorldXZ(b.slot_id, maxPos);
+    if (!slot) continue;
+    const side = (b.slot_id || '')[0];
+    // Box centre within its pallet (local coords from the bin-packer).
+    const localCx = (b.pos_x ?? 0) + (b.dim_x ?? 0) / 2 - _PALLET_LEN_M / 2;
+    const localCyPallet = (b.pos_y ?? 0) + (b.dim_y ?? 0) / 2;
+    let localZ;
+    if (side === 'L') {
+      localZ = -_PALLET_WIDTH_M / 2 + localCyPallet;
+    } else if (side === 'R') {
+      localZ = +_PALLET_WIDTH_M / 2 - localCyPallet;
+    } else {
+      localZ = localCyPallet - _PALLET_WIDTH_M / 2;
+    }
+    const worldX = slot.x + localCx;
+    const worldZ = slot.z + localZ;
+    const worldY = (b.pos_z ?? 0) + (b.dim_h ?? 0) / 2;
+    mx += worldX * mass;
+    mz += worldZ * mass;
+    my += worldY * mass;
+    totalMass += mass;
+  }
+  if (totalMass <= 0) {
+    return {
+      total_kg: 0,
+      lateral_z: 0,
+      longitudinal_x: 0,
+      vertical_y: 0,
+    };
+  }
+  return {
+    total_kg: totalMass,
+    lateral_z: mz / totalMass,
+    longitudinal_x: mx / totalMass,
+    vertical_y: my / totalMass,
   };
 }

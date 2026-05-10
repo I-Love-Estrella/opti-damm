@@ -11,7 +11,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from simulator.api import _bench, _list_algorithms, _list_days, _run_one
+from simulator.api import _bench, _list_algorithms, _list_days, _list_trucks, _run_one
+from simulator.bench.multi_compare import run_compare
+from simulator.bench.multi_run import CaseRef
 
 router = APIRouter(prefix="/copilot", tags=["copilot"])
 
@@ -62,8 +64,14 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "date": {"type": "string", "description": "Route date in YYYY-MM-DD format."},
-                "ruta": {"type": "string", "description": "Route code, for example DR0027."},
+                "date": {
+                    "type": "string",
+                    "description": "Route date in YYYY-MM-DD format.",
+                },
+                "ruta": {
+                    "type": "string",
+                    "description": "Route code, for example DR0027.",
+                },
             },
             "required": ["date", "ruta"],
         },
@@ -74,8 +82,14 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Optional case-insensitive search text."},
-                "limit": {"type": "integer", "description": "Maximum number of clients to return, default 20."},
+                "query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive search text.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of clients to return, default 20.",
+                },
             },
         },
     },
@@ -96,13 +110,24 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "parameters": {"type": "object", "properties": {}},
     },
     {
+        "name": "list_trucks",
+        "description": "Lists available truck specs, capacities, sides, and fleet counts.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
         "name": "list_days",
         "description": "Lists route/day cases that can be simulated.",
         "parameters": {
             "type": "object",
             "properties": {
-                "min_clients": {"type": "integer", "description": "Minimum clients per route, default 5."},
-                "head": {"type": "integer", "description": "Maximum rows to return, default 20."},
+                "min_clients": {
+                    "type": "integer",
+                    "description": "Minimum clients per route, default 5.",
+                },
+                "head": {
+                    "type": "integer",
+                    "description": "Maximum rows to return, default 20.",
+                },
             },
         },
     },
@@ -112,9 +137,15 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "date": {"type": "string", "description": "Route date in YYYY-MM-DD format."},
+                "date": {
+                    "type": "string",
+                    "description": "Route date in YYYY-MM-DD format.",
+                },
                 "ruta": {"type": "string", "description": "Route code."},
-                "algo": {"type": "string", "description": "Algorithm id from list_algorithms."},
+                "algo": {
+                    "type": "string",
+                    "description": "Algorithm id from list_algorithms.",
+                },
             },
             "required": ["date", "ruta", "algo"],
         },
@@ -125,18 +156,72 @@ TOOL_DECLARATIONS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "algos": {"type": "array", "items": {"type": "string"}, "description": "Algorithm ids. Empty means all."},
-                "max_cases": {"type": "integer", "description": "Maximum cases, default 10."},
+                "algos": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Algorithm ids. Empty means all.",
+                },
+                "max_cases": {
+                    "type": "integer",
+                    "description": "Maximum cases, default 10.",
+                },
                 "seed": {"type": "integer", "description": "Random seed, default 42."},
-                "min_clients": {"type": "integer", "description": "Minimum clients per case, default 5."},
+                "min_clients": {
+                    "type": "integer",
+                    "description": "Minimum clients per case, default 5.",
+                },
             },
+        },
+    },
+    {
+        "name": "compare_algorithms",
+        "description": "Compares two algorithms on one explicit route/day case or on a sampled batch of cases.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "algo_a": {"type": "string", "description": "Baseline algorithm id."},
+                "algo_b": {"type": "string", "description": "Comparison algorithm id."},
+                "date": {
+                    "type": "string",
+                    "description": "Optional route date in YYYY-MM-DD format.",
+                },
+                "ruta": {
+                    "type": "string",
+                    "description": "Optional route code. If date and ruta are both provided, compare on exactly this case.",
+                },
+                "sample": {
+                    "type": "string",
+                    "description": "Case selection mode for batch compare: first, random, or all. Default first.",
+                },
+                "n": {
+                    "type": "integer",
+                    "description": "Number of cases for batch compare, default 5.",
+                },
+                "min_clients": {
+                    "type": "integer",
+                    "description": "Minimum clients per sampled case, default 5.",
+                },
+                "seed": {
+                    "type": "integer",
+                    "description": "Random seed for sampled compare, default 42.",
+                },
+                "truck_code": {
+                    "type": "string",
+                    "description": "Optional forced truck code for both algorithms.",
+                },
+            },
+            "required": ["algo_a", "algo_b"],
         },
     },
 ]
 
 
 def _gemini_api_key() -> str | None:
-    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_CLOUD_API_KEY")
+    return (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GOOGLE_CLOUD_API_KEY")
+    )
 
 
 def _vertex_access_token() -> str | None:
@@ -187,7 +272,9 @@ def _route_detail(dl: Any, date: str, ruta: str) -> dict[str, Any]:
         "orders": [
             {
                 "client_id": order.client_id,
-                "client_name": clients_map.get(order.client_id).name if clients_map.get(order.client_id) else order.client_id,
+                "client_name": clients_map.get(order.client_id).name
+                if clients_map.get(order.client_id)
+                else order.client_id,
                 "visit_seq": order.visit_seq_actual,
                 "expected_returnable_units": order.expected_returnable_units,
                 "total_volume_m3": order.total_volume_m3,
@@ -231,7 +318,9 @@ def _client_out(client: Any) -> dict[str, Any]:
     }
 
 
-def _execute_tool(name: str, args: dict[str, Any], request: Request, frontend_context: dict[str, Any]) -> Any:
+def _execute_tool(
+    name: str, args: dict[str, Any], request: Request, frontend_context: dict[str, Any]
+) -> Any:
     dl = request.app.state.dl
 
     if name == "get_frontend_context":
@@ -257,15 +346,24 @@ def _execute_tool(name: str, args: dict[str, Any], request: Request, frontend_co
             clients = [
                 c
                 for c in clients
-                if query in " ".join(str(c.get(k, "")) for k in ("client_id", "name", "address", "cp", "city")).lower()
+                if query
+                in " ".join(
+                    str(c.get(k, ""))
+                    for k in ("client_id", "name", "address", "cp", "city")
+                ).lower()
             ]
         return clients[:limit]
     if name == "get_client":
         return _client_out(dl.get_client(str(args["client_id"])))
     if name == "list_algorithms":
         return {"algorithms": _list_algorithms()}
+    if name == "list_trucks":
+        return {"trucks": _list_trucks()}
     if name == "list_days":
-        return _list_days(min_clients=int(args.get("min_clients") or 5), head=int(args.get("head") or 20))
+        return _list_days(
+            min_clients=int(args.get("min_clients") or 5),
+            head=int(args.get("head") or 20),
+        )
     if name == "run_simulation":
         return _run_one(str(args["date"]), str(args["ruta"]), str(args["algo"]))
     if name == "benchmark_algorithms":
@@ -275,6 +373,27 @@ def _execute_tool(name: str, args: dict[str, Any], request: Request, frontend_co
             seed=int(args.get("seed") or 42),
             min_clients=int(args.get("min_clients") or 5),
         )
+    if name == "compare_algorithms":
+        date = args.get("date")
+        ruta = args.get("ruta")
+        cases = None
+        if date or ruta:
+            if not date or not ruta:
+                raise ValueError(
+                    "compare_algorithms requires both date and ruta when selecting one explicit case"
+                )
+            cases = [CaseRef(date=dt.date.fromisoformat(str(date)), ruta=str(ruta))]
+        report = run_compare(
+            str(args["algo_a"]),
+            str(args["algo_b"]),
+            cases=cases,
+            sample=str(args.get("sample") or "first"),
+            n=max(1, min(20, int(args.get("n") or 5))),
+            min_clients=max(1, int(args.get("min_clients") or 5)),
+            seed=int(args.get("seed") or 42),
+            truck_code=str(args["truck_code"]) if args.get("truck_code") else None,
+        )
+        return report.to_dict()
 
     raise ValueError(f"Unknown tool: {name}")
 
@@ -283,11 +402,19 @@ def _gemini_generate(model: str, payload: dict[str, Any]) -> dict[str, Any]:
     api_key = _gemini_api_key()
     vertex_token = _vertex_access_token()
     vertex_project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("VERTEX_AI_PROJECT")
-    vertex_location = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("VERTEX_AI_LOCATION") or "global"
+    vertex_location = (
+        os.getenv("GOOGLE_CLOUD_LOCATION")
+        or os.getenv("VERTEX_AI_LOCATION")
+        or "global"
+    )
 
     headers = {"Content-Type": "application/json"}
     if vertex_project and vertex_token:
-        service = "aiplatform.googleapis.com" if vertex_location == "global" else f"{vertex_location}-aiplatform.googleapis.com"
+        service = (
+            "aiplatform.googleapis.com"
+            if vertex_location == "global"
+            else f"{vertex_location}-aiplatform.googleapis.com"
+        )
         model_path = f"projects/{vertex_project}/locations/{vertex_location}/publishers/google/models/{model}"
         url = f"https://{service}/v1/{model_path}:generateContent"
         headers["Authorization"] = f"Bearer {vertex_token}"
@@ -314,9 +441,13 @@ def _gemini_generate(model: str, payload: dict[str, Any]) -> dict[str, Any]:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise HTTPException(status_code=502, detail=_gemini_error_detail(detail)) from exc
+        raise HTTPException(
+            status_code=502, detail=_gemini_error_detail(detail)
+        ) from exc
     except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"Gemini API unreachable: {exc.reason}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Gemini API unreachable: {exc.reason}"
+        ) from exc
 
 
 def _gemini_error_detail(raw_detail: str) -> str:
@@ -384,7 +515,9 @@ def chat(body: ChatRequest, request: Request):
 
     model = _gemini_model()
     contents = _history(body.messages)
-    context_json = json.dumps(_json_safe(body.frontend_context), ensure_ascii=False)[:12000]
+    context_json = json.dumps(_json_safe(body.frontend_context), ensure_ascii=False)[
+        :12000
+    ]
     contents.append(
         {
             "role": "user",
@@ -414,7 +547,11 @@ def chat(body: ChatRequest, request: Request):
         calls = [part["functionCall"] for part in parts if part.get("functionCall")]
         if not calls:
             reply = _text_from_parts(parts)
-            return ChatResponse(reply=reply or "I could not produce a response.", tool_calls=tool_calls, model=model)
+            return ChatResponse(
+                reply=reply or "I could not produce a response.",
+                tool_calls=tool_calls,
+                model=model,
+            )
 
         contents.append(response["candidates"][0]["content"])
         response_parts = []
@@ -422,11 +559,15 @@ def chat(body: ChatRequest, request: Request):
             name = call.get("name")
             args = call.get("args") or {}
             try:
-                result = _json_safe(_execute_tool(name, args, request, body.frontend_context))
+                result = _json_safe(
+                    _execute_tool(name, args, request, body.frontend_context)
+                )
                 tool_calls.append({"name": name, "args": args, "ok": True})
             except Exception as exc:
                 result = {"error": str(exc)}
-                tool_calls.append({"name": name, "args": args, "ok": False, "error": str(exc)})
+                tool_calls.append(
+                    {"name": name, "args": args, "ok": False, "error": str(exc)}
+                )
 
             function_response = {
                 "name": name,

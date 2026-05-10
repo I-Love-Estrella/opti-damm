@@ -1,63 +1,54 @@
 'use client';
 
 import React from 'react';
-import { SKU_TONE, STOP_TONE, CLIENT_ORDERS, TRUCK_TYPES } from '@/data';
 
-const TRUCK_MODES = [
-  { key: "reference", label: "By Reference" },
-  { key: "client",    label: "By Client" },
-  { key: "hybrid",    label: "Hybrid" },
-];
-
-const MODE_HELP = {
-  reference: "same SKU together — fastest pick at depot",
-  client:    "one cluster per client — fastest unload",
-  hybrid:    "client clusters, heavies near cab — best balance",
+const SKU_COLORS = {
+  EST: '#C8553D',
+  VOL: '#588B8B',
+  MAL: '#F2C078',
+  MOR: '#8C7A6B',
+  AGV: '#7FB285',
 };
 
+const FALLBACK_COLORS = ['#A0937D', '#B5838D', '#6D6875', '#E5989B', '#FFB4A2', '#CDDAFD', '#DFE7FD'];
+
+function skuColor(code) {
+  if (SKU_COLORS[code]) return SKU_COLORS[code];
+  let hash = 0;
+  for (let i = 0; i < (code || '').length; i++) hash = code.charCodeAt(i) + ((hash << 5) - hash);
+  return FALLBACK_COLORS[Math.abs(hash) % FALLBACK_COLORS.length];
+}
+
 function skuName(s) {
-  return ({ EST: "Estrella 33cl", VOL: "Voll-Damm 33cl", MAL: "Malquerida 75cl", MOR: "Moritz 33cl", AGV: "Agua 1.5L" })[s] || s;
+  return ({ EST: 'Estrella 33cl', VOL: 'Voll-Damm 33cl', MAL: 'Malquerida 75cl', MOR: 'Moritz 33cl', AGV: 'Agua 1.5L' })[s] || s;
 }
 
 function shortClient(c) {
-  if (!c) return "";
-  return c.length > 12 ? c.slice(0, 11) + "…" : c;
+  if (!c) return '';
+  return c.length > 14 ? c.slice(0, 13) + '…' : c;
 }
 
-export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, onPalletHover, hoveredPallet, onPalletClick, selectedClient, truckType, onTruckTypeChange }) {
-  const spec = TRUCK_TYPES[truckType] || TRUCK_TYPES.T6;
+export default function TruckPanel({ pallets, hoveredStop, onPalletHover, hoveredPallet, onPalletClick, selectedClient, truck }) {
+  const cap = truck?.capacity || pallets.length || 0;
+  const cols = truck?.cols || 2;
   const totalCells = pallets.length;
   const filled = pallets.filter(p => p.sku).length;
-  const utilization = Math.round((filled / totalCells) * 100);
+  const utilization = totalCells > 0 ? Math.round((filled / totalCells) * 100) : 0;
   const totalWt = pallets.reduce((acc, p) => acc + (p.wt || 0), 0);
-  const rows = Math.ceil(spec.capacity / spec.cols);
+  const rows = Math.ceil(cap / cols);
+  const maxKg = truck?.maxKg || 0;
 
-  function tone(p) {
-    if (!p.sku) return null;
-    if (mode === "reference") return SKU_TONE[p.sku] || "1";
-    return STOP_TONE[p.stop] || "1";
-  }
-
-  const legendItems = (() => {
-    const seen = new Map();
+  const skuLegend = (() => {
+    const totals = new Map();
     pallets.forEach(p => {
-      if (!p.sku) return;
-      const key = mode === "reference" ? p.sku : p.stop;
-      if (seen.has(key)) {
-        const v = seen.get(key); v.count++; seen.set(key, v);
-      } else {
-        seen.set(key, {
-          tone: tone(p),
-          label: mode === "reference" ? p.sku : `S-0${p.stop}`,
-          sub:   mode === "reference" ? skuName(p.sku) : (p.client || ""),
-          count: 1,
-        });
+      for (const it of (p.items || [])) {
+        totals.set(it.sku, (totals.get(it.sku) || 0) + it.qty);
       }
     });
-    return Array.from(seen.values());
+    return Array.from(totals.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([sku, qty]) => ({ sku, qty, color: skuColor(sku) }));
   })();
-
-  const orders = selectedClient ? CLIENT_ORDERS[selectedClient.name] : null;
 
   return (
     <div className="panel truck-panel">
@@ -65,56 +56,30 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
         <div className="panel-title">
           <span className="panel-index">02</span>
           Load
-          <span className="panel-code">{spec.code} · {spec.capacity} PLT</span>
+          <span className="panel-code">{truck?.code || '—'} · {cap} PLT</span>
         </div>
         <div className="panel-readout">
           <span className="ro-row"><strong>{utilization}%</strong> · {filled}/{totalCells} PLT</span>
-          <span className="ro-row ro-dim">{totalWt} KG / {spec.maxKg} KG</span>
+          <span className="ro-row ro-dim">{totalWt} KG{maxKg ? ` / ${maxKg} KG` : ''}</span>
         </div>
       </div>
 
-      <div className="truck-type-toggle">
-        {Object.values(TRUCK_TYPES).map(t => (
-          <button
-            key={t.code}
-            className={`truck-type-btn ${truckType === t.code ? 'active' : ''}`}
-            onClick={() => onTruckTypeChange(t.code)}
-          >
-            {t.code}
-            <span className="tt-sub">{t.capacity}P · ×{t.fleet}</span>
-          </button>
-        ))}
-      </div>
-
-      <div className="mode-toggle">
-        {TRUCK_MODES.map(m => (
-          <button
-            key={m.key}
-            className={`mode-btn ${mode === m.key ? 'active' : ''}`}
-            onClick={() => onModeChange(m.key)}
-          >
-            {m.label}
-          </button>
-        ))}
-      </div>
-      <div className="mode-help">{MODE_HELP[mode]}</div>
-
       <div className="truck-caption">
-        <span>Top-down view · {spec.cols} × {rows} grid · {spec.capacity} pallet slots</span>
-        <span className="t-sub">colour = {mode === "reference" ? "SKU" : "destination stop"}</span>
+        <span>Top-down view · {cols} × {rows} grid · {cap} pallet slots</span>
+        <span className="t-sub">colour = SKU breakdown</span>
       </div>
 
       <div className="truck-wrap">
         <span className="truck-label tl-cab">↑ CAB · FRONT</span>
         <span className="truck-label tl-rear">REAR DOORS ↓</span>
-        <div className="pallet-grid" style={{ gridTemplateColumns: `repeat(${spec.cols}, 1fr)` }}>
+        <div className="pallet-grid" style={{ gridTemplateColumns: `repeat(${cols}, 1fr)` }}>
           {pallets.map(p => {
             const isHL = hoveredStop && p.stop === hoveredStop.id;
+            const items = p.items || [];
             return (
               <div
-                key={`${truckType}-${mode}-${p.idx}`}
+                key={`pal-${p.idx}`}
                 className={`pallet ${!p.sku ? 'empty' : ''} ${isHL ? 'highlight' : ''}`}
-                data-tone={tone(p)}
                 onMouseEnter={() => p.sku && onPalletHover && onPalletHover(p)}
                 onMouseLeave={() => onPalletHover && onPalletHover(null)}
                 onClick={() => p.sku && onPalletClick && onPalletClick(p)}
@@ -122,11 +87,32 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
                 {p.sku ? (
                   <>
                     <div className="p-top">
-                      <span className="p-stop-ring">{p.stop}</span>
-                      <span className="p-sku">{p.sku}</span>
+                      <span className="p-stop-ring">{p.stop ?? '—'}</span>
+                      <span className="p-client">{shortClient(p.client)}</span>
+                      {p.ret && <span className="p-recycle" title="returnable">↻</span>}
                     </div>
-                    <div className="p-client">{shortClient(p.client)}</div>
-                    {p.ret && <div className="p-recycle" title="returnable">↻</div>}
+                    <div className="p-bar">
+                      {items.map((it, i) => (
+                        <div
+                          key={i}
+                          className="p-bar-seg"
+                          style={{
+                            flex: it.qty,
+                            backgroundColor: skuColor(it.sku),
+                          }}
+                          title={`${it.sku} ×${it.qty}`}
+                        />
+                      ))}
+                    </div>
+                    <div className="p-breakdown">
+                      {items.slice(0, 3).map((it, i) => (
+                        <span key={i} className="p-item">
+                          <span className="p-item-dot" style={{ backgroundColor: skuColor(it.sku) }} />
+                          {it.sku} <span className="p-item-qty">×{it.qty}</span>
+                        </span>
+                      ))}
+                      {items.length > 3 && <span className="p-item p-item-more">+{items.length - 3}</span>}
+                    </div>
                   </>
                 ) : (
                   <div className="p-empty-label">empty slot</div>
@@ -138,16 +124,14 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
       </div>
 
       <div className="legend">
-        <div className="legend-head">
-          {mode === "reference" ? "BY SKU" : "BY DESTINATION"}
-        </div>
+        <div className="legend-head">BY SKU</div>
         <div className="legend-items">
-          {legendItems.map((it, i) => (
+          {skuLegend.map((it, i) => (
             <div key={i} className="legend-item">
-              <span className="legend-swatch" data-tone={it.tone}></span>
-              <span className="legend-label">{it.label}</span>
-              <span className="legend-sub">{it.sub}</span>
-              <span className="legend-count">×{it.count}</span>
+              <span className="legend-swatch" style={{ backgroundColor: it.color }} />
+              <span className="legend-label">{it.sku}</span>
+              <span className="legend-sub">{skuName(it.sku)}</span>
+              <span className="legend-count">×{it.qty}</span>
             </div>
           ))}
         </div>
@@ -166,7 +150,7 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
                        (hoveredStop && p.stop === hoveredStop.id);
           if (!p.sku) {
             return (
-              <div key={`mf-${truckType}-${mode}-${p.idx}`} className="manifest-row empty">
+              <div key={`mf-${p.idx}`} className="manifest-row empty">
                 <span className="m-code">{p.code}</span>
                 <span className="m-client">— empty —</span>
                 <span className="m-stop">—</span>
@@ -177,7 +161,7 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
           }
           return (
             <div
-              key={`mf-${truckType}-${mode}-${p.idx}`}
+              key={`mf-${p.idx}`}
               className={`manifest-row ${isHL ? 'highlight' : ''}`}
               onMouseEnter={() => onPalletHover && onPalletHover(p)}
               onMouseLeave={() => onPalletHover && onPalletHover(null)}
@@ -185,7 +169,7 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
             >
               <span className="m-code">{p.code} · {p.sku}</span>
               <span className="m-client">{p.client}</span>
-              <span className="m-stop">S-0{p.stop}</span>
+              <span className="m-stop">{p.stop != null ? `S-${String(p.stop).padStart(2, '0')}` : '—'}</span>
               <span className="m-wt">{p.wt}</span>
               <span className={`m-ret ${p.ret ? 'yes' : ''}`}>{p.ret ? '↻' : '—'}</span>
             </div>
@@ -193,19 +177,11 @@ export default function TruckPanel({ mode, onModeChange, pallets, hoveredStop, o
         })}
       </div>
 
-      {selectedClient && orders && (
+      {selectedClient && (
         <div className="client-detail">
           <div className="cd-name">{selectedClient.name}</div>
           <div className="cd-meta">
-            {selectedClient.code} · {selectedClient.neighborhood} · {selectedClient.window} · ETA {selectedClient.eta}
-          </div>
-          <div className="cd-list">
-            {orders.map(([sku, qty], i) => (
-              <React.Fragment key={i}>
-                <span>{sku}</span>
-                <span className="qty">{qty}</span>
-              </React.Fragment>
-            ))}
+            {selectedClient.code} · {selectedClient.neighborhood} · ETA {selectedClient.eta}
           </div>
         </div>
       )}

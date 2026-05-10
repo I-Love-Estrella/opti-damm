@@ -78,7 +78,7 @@ export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, h
 
     const depotIcon = L.divIcon({
       className: "depot-marker",
-      html: `<div class="depot-square"><span class="depot-star">★</span></div><div class="depot-label">MOLLET DEPOT</div>`,
+      html: `<div class="depot-square"><span class="depot-star">★</span></div><div class="depot-label">${(warehouse.name || 'DEPOT').toUpperCase()}</div>`,
       iconSize: [80, 40],
       iconAnchor: [10, 10],
     });
@@ -130,17 +130,11 @@ export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, h
     let cancelled = false;
     setRouteMeta(m => ({ ...m, status: "fetching" }));
 
-    const completedStops = visibleStops.filter(s => s.status === "completed");
-    const currentStop = visibleStops.find(s => s.status === "current");
-    const upcomingStops = visibleStops.filter(s => s.status === "upcoming");
-
-    const completedSeg = [warehouse.latlng, ...completedStops.map(s => s.latlng)];
-    if (currentStop) completedSeg.push(currentStop.latlng);
-
-    const upcomingSeg = [];
-    if (currentStop) upcomingSeg.push(currentStop.latlng);
-    upcomingStops.forEach(s => upcomingSeg.push(s.latlng));
-    if (upcomingStops.length) upcomingSeg.push(warehouse.latlng);
+    // Planning view: a single planned route from depot through all stops back to depot.
+    const completedSeg = [];
+    const upcomingSeg = visibleStops.length
+      ? [warehouse.latlng, ...visibleStops.map(s => s.latlng), warehouse.latlng]
+      : [];
 
     async function go() {
       layersRef.current.routes.forEach(p => p.remove());
@@ -201,18 +195,16 @@ export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, h
     return () => { cancelled = true; };
   }, [visibleStops, warehouse]);
 
-  const completedCount = visibleStops.filter(s => s.status === "completed").length;
-
   return (
     <div className="panel map-panel">
       <div className="panel-head">
         <div className="panel-title">
           <span className="panel-index">01</span>
           Route
-          <span className="panel-code">RTE-2026.05.09.A</span>
+          <span className="panel-code">PLAN</span>
         </div>
         <div className="panel-readout">
-          <span className="ro-row"><strong>{completedCount}</strong>/{visibleStops.length} STOPS · MOLLET → VALLÈS</span>
+          <span className="ro-row"><strong>{visibleStops.length}</strong> STOPS PLANNED</span>
           <span className="ro-row ro-dim">
             {routeMeta.status === "fetching" && "ROUTING via OSRM…"}
             {routeMeta.status === "ok" && `${routeMeta.km} KM · ${routeMeta.eta} DRIVE · OSRM`}
@@ -225,7 +217,7 @@ export default function MapPanel({ stops, warehouse, onStopHover, onStopClick, h
         <div className="leaflet-host" ref={wrapRef}></div>
 
         <div className="map-overlay map-overlay-tl">
-          <div className="ov-chip">MOLLET · 41.54°N · 2.21°E</div>
+          <div className="ov-chip">{(warehouse.name || 'DEPOT').toUpperCase()} · {warehouse.latlng[0].toFixed(2)}°N · {warehouse.latlng[1].toFixed(2)}°E</div>
           <div className="ov-chip ov-chip-dim">EPSG:3857 · WEBMERC</div>
         </div>
         <div className="map-overlay map-overlay-tr">
